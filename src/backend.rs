@@ -3,6 +3,34 @@ use clap::ValueEnum;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 
+#[derive(Default)]
+pub struct Resources {
+    pub requests: Vec<(String, String)>,
+    pub limits: Vec<(String, String)>,
+}
+
+impl Resources {
+    fn json(&self) -> Option<serde_json::Value> {
+        fn map(kvs: &[(String, String)]) -> Option<serde_json::Value> {
+            (!kvs.is_empty()).then(|| {
+                serde_json::Value::Object(
+                    kvs.iter()
+                        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+                        .collect(),
+                )
+            })
+        }
+        let mut out = serde_json::Map::new();
+        if let Some(r) = map(&self.requests) {
+            out.insert("requests".to_string(), r);
+        }
+        if let Some(l) = map(&self.limits) {
+            out.insert("limits".to_string(), l);
+        }
+        (!out.is_empty()).then_some(serde_json::Value::Object(out))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Backend {
     /// rootless buildkitd, driven one-shot via buildctl-daemonless.sh
@@ -111,6 +139,7 @@ impl Backend {
         image: &str,
         dockerfile: &str,
         build_args: &[String],
+        labels: &[(String, String)],
     ) -> Vec<Vec<String>> {
         let ws = self.workspace();
         match self {
@@ -135,6 +164,10 @@ impl Backend {
                     build.push("--opt".to_string());
                     build.push(format!("build-arg:{arg}"));
                 }
+                for (k, v) in labels {
+                    build.push("--opt".to_string());
+                    build.push(format!("label:{k}={v}"));
+                }
                 vec![build]
             }
             Backend::Kaniko => {
@@ -149,6 +182,10 @@ impl Backend {
                 for arg in build_args {
                     exec.push(format!("--build-arg={arg}"));
                 }
+                for (k, v) in labels {
+                    exec.push("--label".to_string());
+                    exec.push(format!("{k}={v}"));
+                }
                 vec![exec]
             }
             // isolation/storage-driver flags live in the pod spec env
@@ -162,6 +199,10 @@ impl Backend {
                 for arg in build_args {
                     bud.push("--build-arg".to_string());
                     bud.push(arg.clone());
+                }
+                for (k, v) in labels {
+                    bud.push("--label".to_string());
+                    bud.push(format!("{k}={v}"));
                 }
                 bud.extend([
                     "-f".to_string(),
@@ -193,8 +234,14 @@ impl Backend {
         }
     }
 
-    pub fn pod_spec(&self, name: &str, namespace: &str, idle_nodes: &[String]) -> Result<Pod> {
-        let container = match self {
+    pub fn pod_spec(
+        &self,
+        name: &str,
+        namespace: &str,
+        idle_nodes: &[String],
+        resources: &Resources,
+    ) -> Result<Pod> {
+        let mut container = match self {
             Backend::Buildkit => serde_json::json!({
                 "name": "builder",
                 "image": "moby/buildkit:rootless",
@@ -241,6 +288,9 @@ impl Backend {
                 }]
             }),
         };
+        if let Some(res) = resources.json() {
+            container["resources"] = res;
+        }
         let volumes = match self {
             Backend::Buildkit => {
                 serde_json::json!([{ "name": "buildkit-storage", "emptyDir": {} }])
@@ -298,14 +348,21 @@ impl Backend {
         image: &str,
         dockerfile: &str,
         build_args: &[String],
+        labels: &[(String, String)],
     ) -> serde_json::Value {
         let df = format!("/workspace/{dockerfile}");
         let mut container = match self {
             Backend::Buildkit => {
-                let args: String = build_args
+                let mut args: String = build_args
                     .iter()
                     .map(|a| format!(" --opt build-arg:{}", shell_quote(a)))
                     .collect();
+                for (k, v) in labels {
+                    args.push_str(&format!(
+                        " --opt {}",
+                        shell_quote(&format!("label:{k}={v}"))
+                    ));
+                }
                 // metadata goes to /tmp first: buildctl writes it atomically
                 // (tmp + rename) and you can't rename onto the bind-mounted
                 // termination-log file, only write into it
@@ -347,6 +404,9 @@ impl Backend {
                 for arg in build_args {
                     command.push(format!("--build-arg={arg}"));
                 }
+                for (k, v) in labels {
+                    command.push(format!("--label={k}={v}"));
+                }
                 serde_json::json!({
                     "image": "gcr.io/kaniko-project/executor:debug",
                     "command": command,
@@ -354,10 +414,13 @@ impl Backend {
                 })
             }
             Backend::Buildah => {
-                let args: String = build_args
+                let mut args: String = build_args
                     .iter()
                     .map(|a| format!(" --build-arg {}", shell_quote(a)))
                     .collect();
+                for (k, v) in labels {
+                    args.push_str(&format!(" --label {}", shell_quote(&format!("{k}={v}"))));
+                }
                 let script = format!(
                     "printf '[storage]\\ndriver = \"vfs\"\\ngraphroot = \"/home/build/.local/share/containers/storage\"\\nrunroot = \"/tmp/containers-run\"\\n' > /tmp/storage.conf \
                      && mkdir -p /tmp/containers-run \
@@ -398,18 +461,17 @@ impl Backend {
         container
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn job_spec(
         &self,
         name: &str,
         namespace: &str,
-        image: &str,
-        dockerfile: &str,
-        build_args: &[String],
-        ctx_ref: &str,
-        idle_nodes: &[String],
+        args: &crate::job::DetachArgs<'_>,
     ) -> Result<Job> {
-        let builder = self.job_builder_container(image, dockerfile, build_args);
+        let mut builder =
+            self.job_builder_container(args.image, args.dockerfile, args.build_args, args.labels);
+        if let Some(res) = args.resources.json() {
+            builder["resources"] = res;
+        }
         let mut backend_volumes = match self {
             Backend::Buildkit => {
                 vec![serde_json::json!({ "name": "buildkit-storage", "emptyDir": {} })]
@@ -437,7 +499,7 @@ impl Backend {
                 "name": name,
                 "namespace": namespace,
                 "labels": { "app": "buildit", "buildit/backend": self.label() },
-                "annotations": { "buildit/image": image }
+                "annotations": { "buildit/image": args.image }
             },
             "spec": {
                 // retries are safe: the context is content-addressed in the registry
@@ -462,7 +524,7 @@ impl Backend {
                             "command": ["sh", "-c", "crane export \"$CTX_REF\" - | tar -x -C /workspace"],
                             "env": [
                                 { "name": "DOCKER_CONFIG", "value": "/auth" },
-                                { "name": "CTX_REF", "value": ctx_ref }
+                                { "name": "CTX_REF", "value": args.ctx_ref }
                             ],
                             "volumeMounts": [
                                 { "name": "workspace", "mountPath": "/workspace" },
@@ -475,7 +537,7 @@ impl Backend {
                 }
             }
         });
-        if !idle_nodes.is_empty() {
+        if !args.idle_nodes.is_empty() {
             spec["spec"]["template"]["spec"]["affinity"] = serde_json::json!({
                 "nodeAffinity": {
                     "preferredDuringSchedulingIgnoredDuringExecution": [{
@@ -484,7 +546,7 @@ impl Backend {
                             "matchExpressions": [{
                                 "key": "kubernetes.io/hostname",
                                 "operator": "In",
-                                "values": idle_nodes
+                                "values": args.idle_nodes
                             }]
                         }
                     }]
@@ -501,7 +563,7 @@ fn shell_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::Backend;
+    use crate::backend::{Backend, Resources};
 
     #[test]
     fn buildkit_build_steps() {
@@ -509,6 +571,7 @@ mod tests {
             "quay.io/acme/foo:tag",
             "Dockerfile.tap",
             &["FOO=bar".to_string()],
+            &[("quay.expires-after".to_string(), "1d".to_string())],
         );
         assert_eq!(steps.len(), 1);
         let argv = &steps[0];
@@ -516,6 +579,7 @@ mod tests {
         assert!(argv.contains(&"filename=Dockerfile.tap".to_string()));
         assert!(argv.contains(&"type=image,name=quay.io/acme/foo:tag,push=true".to_string()));
         assert!(argv.contains(&"build-arg:FOO=bar".to_string()));
+        assert!(argv.contains(&"label:quay.expires-after=1d".to_string()));
     }
 
     #[test]
@@ -524,6 +588,7 @@ mod tests {
             "quay.io/acme/foo:tag",
             "Dockerfile.tap",
             &["FOO=bar".to_string()],
+            &[("team".to_string(), "infra".to_string())],
         );
         assert_eq!(steps.len(), 1);
         let argv = &steps[0];
@@ -532,11 +597,17 @@ mod tests {
         assert!(argv.contains(&"--destination=quay.io/acme/foo:tag".to_string()));
         assert!(argv.contains(&"--digest-file=/tmp/digest".to_string()));
         assert!(argv.contains(&"--build-arg=FOO=bar".to_string()));
+        assert!(argv.contains(&"--label".to_string()) || argv.contains(&"team=infra".to_string()));
     }
 
     #[test]
     fn buildah_build_steps() {
-        let steps = Backend::Buildah.build_steps("quay.io/acme/foo:tag", "Dockerfile", &[]);
+        let steps = Backend::Buildah.build_steps(
+            "quay.io/acme/foo:tag",
+            "Dockerfile",
+            &[],
+            &[("team".to_string(), "infra".to_string())],
+        );
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0][..2], ["buildah".to_string(), "bud".to_string()]);
         assert_eq!(steps[1][..2], ["buildah".to_string(), "push".to_string()]);
@@ -545,6 +616,7 @@ mod tests {
             Some("docker://quay.io/acme/foo:tag")
         );
         assert!(steps[1].contains(&"--digestfile".to_string()));
+        assert!(steps[0].contains(&"team=infra".to_string()));
     }
 
     #[test]
@@ -558,16 +630,25 @@ mod tests {
 
     #[test]
     fn job_specs_deserialize() {
+        let resources = crate::backend::Resources {
+            requests: vec![("cpu".to_string(), "2".to_string())],
+            limits: vec![("memory".to_string(), "8Gi".to_string())],
+        };
         for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
             let job = backend
                 .job_spec(
                     "buildit-abc123",
                     "builds",
-                    "quay.io/acme/foo:tag",
-                    "Dockerfile",
-                    &["FOO=bar".to_string()],
-                    "quay.io/acme/foo:buildit-ctx-deadbeef0123",
-                    &["node-a".to_string()],
+                    &crate::job::DetachArgs {
+                        image: "quay.io/acme/foo:tag",
+                        dockerfile: "Dockerfile",
+                        build_args: &["FOO=bar".to_string()],
+                        ctx_ref: "quay.io/acme/foo:buildit-ctx-deadbeef0123",
+                        authfile: b"",
+                        idle_nodes: &["node-a".to_string()],
+                        resources: &resources,
+                        labels: &[("team".to_string(), "infra".to_string())],
+                    },
                 )
                 .unwrap();
             let spec = job.spec.unwrap();
@@ -599,6 +680,9 @@ mod tests {
             assert!(mounts.contains(&"/auth"), "{mounts:?}");
             let cmd = builder.command.as_deref().unwrap_or_default().join(" ");
             assert!(cmd.contains("/dev/termination-log"), "{cmd}");
+            let res = builder.resources.as_ref().unwrap();
+            assert_eq!(res.requests.as_ref().unwrap()["cpu"].0, "2");
+            assert_eq!(res.limits.as_ref().unwrap()["memory"].0, "8Gi");
             let annotations = job.metadata.annotations.unwrap();
             assert_eq!(
                 annotations.get("buildit/image").map(String::as_str),
@@ -621,8 +705,20 @@ mod tests {
 
     #[test]
     fn pod_specs_deserialize_with_and_without_affinity() {
+        let cpu2 = crate::backend::Resources {
+            requests: vec![("cpu".to_string(), "2".to_string())],
+            limits: vec![],
+        };
         for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
-            let pod = backend.pod_spec("buildit-abc123", "builds", &[]).unwrap();
+            let pod = backend
+                .pod_spec("buildit-abc123", "builds", &[], &cpu2)
+                .unwrap();
+            let res = pod.spec.as_ref().unwrap().containers[0]
+                .resources
+                .as_ref()
+                .unwrap();
+            assert_eq!(res.requests.as_ref().unwrap()["cpu"].0, "2");
+            assert!(res.limits.is_none());
             let spec = pod.spec.unwrap();
             assert_eq!(spec.active_deadline_seconds, Some(7200));
             assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -631,7 +727,9 @@ mod tests {
             assert_eq!(labels.get("app").map(String::as_str), Some("buildit"));
 
             let idle = vec!["node-a".to_string(), "node-b".to_string()];
-            let pod = backend.pod_spec("buildit-abc123", "builds", &idle).unwrap();
+            let pod = backend
+                .pod_spec("buildit-abc123", "builds", &idle, &Resources::default())
+                .unwrap();
             let affinity = pod.spec.unwrap().affinity.unwrap();
             let prefs = affinity
                 .node_affinity

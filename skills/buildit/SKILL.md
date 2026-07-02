@@ -39,7 +39,7 @@ Job (context pushed to the registry, survives client disconnect, retries
 safely) and you reattach whenever:
 
 ```bash
-JOB=$(buildit build registry.example.com/team/foo:tag -n builds --detach | tail -1)
+JOB=$(buildit build registry.example.com/team/foo:tag -n builds --mode job | tail -1)
 buildit wait $JOB -n builds        # follows logs, prints the digest-pinned ref
 ```
 
@@ -58,7 +58,7 @@ kaniko is unmaintained upstream, kept as fallback. buildah runs rootless with
 chroot isolation + vfs storage (slower on layer-heavy images).
 
 Builder pods get a best-effort nodeAffinity for nodes with no GPU-requesting
-pods, so builds stay off active GPU workloads (`--any-node` to skip).
+pods, so builds stay off active GPU workloads (`--schedule any` to skip).
 
 ## Redeploy after a successful push
 

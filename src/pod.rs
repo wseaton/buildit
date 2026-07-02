@@ -30,10 +30,11 @@ impl BuilderPod {
         namespace: &str,
         backend: Backend,
         idle_nodes: &[String],
+        resources: &crate::backend::Resources,
     ) -> Result<Self> {
         let pods: Api<Pod> = Api::namespaced(client, namespace);
         let name = unique_name();
-        let spec = backend.pod_spec(&name, namespace, idle_nodes)?;
+        let spec = backend.pod_spec(&name, namespace, idle_nodes, resources)?;
         pods.create(&PostParams::default(), &spec)
             .await
             .with_context(|| format!("creating pod {name} in {namespace}"))?;

@@ -64,20 +64,80 @@ pub struct BuildArgs {
     /// rootless (uid 1000), kaniko is the legacy (unmaintained) fallback.
     #[arg(long, value_enum, default_value_t = Backend::Buildkit)]
     pub backend: Backend,
-    /// Skip the idle-node scout and let the scheduler place the pod anywhere
-    #[arg(long)]
-    pub any_node: bool,
-    /// Run the build as a Kubernetes Job and return immediately. The context
-    /// is pushed to the registry so the build survives client disconnect;
-    /// follow up with `buildit wait <job>`.
-    #[arg(long)]
-    pub detach: bool,
+    /// pod: interactive build driven over the exec API, deleted when done.
+    /// job: context pushed to the registry, build runs as a Kubernetes Job
+    /// that survives client disconnect; follow up with `buildit wait <job>`.
+    #[arg(long, value_enum, default_value_t = Mode::Pod)]
+    pub mode: Mode,
+    /// apply: create the resources and run the build. render: print the
+    /// manifests to stdout as YAML (no cluster access, no context push,
+    /// secret data redacted).
+    #[arg(long, value_enum, default_value_t = Output::Apply)]
+    pub output: Output,
+    /// idle: prefer nodes with no GPU workloads (best effort). any: skip the
+    /// scout and let the scheduler place the builder anywhere.
+    #[arg(long, value_enum, default_value_t = Schedule::Idle)]
+    pub schedule: Schedule,
+    /// Resource requests for the builder container, repeatable: --request cpu=2 --request memory=4Gi
+    #[arg(long = "request", value_name = "KEY=QTY", value_parser = parse_kv)]
+    pub requests: Vec<(String, String)>,
+    /// Resource limits for the builder container, repeatable: --limit cpu=8 --limit memory=16Gi
+    #[arg(long = "limit", value_name = "KEY=QTY", value_parser = parse_kv)]
+    pub limits: Vec<(String, String)>,
+    /// Labels for the built image, repeatable: --label team=infra
+    #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_kv)]
+    pub labels: Vec<(String, String)>,
+    /// Labels for the pushed context image (job mode). Defaults to
+    /// quay.expires-after=2w on quay registries so buildit-ctx-* tags
+    /// self-prune; pass any --context-label to override the default.
+    #[arg(long = "context-label", value_name = "KEY=VALUE", value_parser = parse_kv)]
+    pub context_labels: Vec<(String, String)>,
     /// Build args, repeatable: --build-arg KEY=VALUE
     #[arg(long = "build-arg", value_name = "KEY=VALUE")]
     pub build_args: Vec<String>,
     /// Kubeconfig context to use (defaults to the current context)
     #[arg(long)]
     pub kubecontext: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Mode {
+    /// interactive builder pod, exec-driven
+    Pod,
+    /// detached Kubernetes Job, reattach with `buildit wait`
+    Job,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Output {
+    /// create the resources and run the build
+    Apply,
+    /// print manifests as YAML without touching the cluster
+    Render,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Schedule {
+    /// prefer nodes without active GPU workloads (best effort)
+    Idle,
+    /// no placement hints
+    Any,
+}
+
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .ok_or_else(|| format!("expected KEY=QTY, got {s:?}"))
+}
+
+impl BuildArgs {
+    fn resources(&self) -> backend::Resources {
+        backend::Resources {
+            requests: self.requests.clone(),
+            limits: self.limits.clone(),
+        }
+    }
 }
 
 async fn client_for(kubecontext: Option<&str>) -> Result<kube::Client> {
@@ -120,10 +180,13 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Build(args) => {
-            let client = client_for(args.kubecontext.as_deref()).await?;
-            build::run(client, &args).await
-        }
+        Cmd::Build(args) => match args.output {
+            Output::Render => build::render(&args),
+            Output::Apply => {
+                let client = client_for(args.kubecontext.as_deref()).await?;
+                build::run(client, &args).await
+            }
+        },
         Cmd::Wait {
             job,
             namespace,

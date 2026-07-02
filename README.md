@@ -42,8 +42,12 @@ buildit build quay.io/acme/foo:tag                 # context=., Dockerfile, curr
 buildit build quay.io/acme/foo:tag \
   -f Dockerfile.prod -c ./svc -n builds \
   --backend buildah --build-arg FOO=bar
-JOB=$(buildit build quay.io/acme/foo:tag --detach | tail -1)   # fire and forget
+JOB=$(buildit build quay.io/acme/foo:tag --mode job | tail -1)   # fire and forget
 buildit wait $JOB                                  # reattach anytime, prints the digest
+buildit build quay.io/acme/foo:tag \
+  --request cpu=4 --request memory=8Gi --limit memory=16Gi \
+  --label team=infra                               # builder resources + image labels
+buildit build quay.io/acme/foo:tag --output render # print manifests, touch nothing
 buildit clean                                      # delete leftover builder pods/jobs
 ```
 
@@ -85,19 +89,19 @@ Before creating the builder pod, buildit lists nodes and pods and adds a
 *preferred* nodeAffinity for Ready, schedulable nodes with zero
 GPU-requesting pods, keeping builds off nodes with active GPU workloads.
 Best effort only: if the scout fails (RBAC) or no node is idle, the build
-schedules normally. `--any-node` skips the scout.
+schedules normally. `--schedule any` skips the scout.
 
 Builder pods are labeled `app=buildit`, self-terminate after 2h
 (`activeDeadlineSeconds`), and are deleted on completion, error, or ctrl-C;
 `buildit clean` sweeps any survivors.
 
-## Detached builds (`--detach` + `wait`)
+## Detached builds (`--mode job` + `wait`)
 
 The default mode is interactive: context streamed over the exec API, build
 driven by execs, pod deleted when done. Fast and zero-footprint, but the
 build's fate is tied to your connection.
 
-`--detach` trades a little registry storage for durability. The context is
+`--mode job` trades a little registry storage for durability. The context is
 pushed to the registry as a single-layer OCI image (via
 [`oci-client`](https://github.com/oras-project/rust-oci-client)), tagged
 `buildit-ctx-<sha256[..12]>` in the target repo — content-addressed, so an
@@ -112,15 +116,15 @@ for real: `backoffLimit: 2` retries rebuild from a re-fetched context,
 `ttlSecondsAfterFinished: 3600` garbage-collects the Job, its pods, and (via
 the ownerRef) the Secret an hour after finishing.
 
-`buildit build ... --detach` prints the job name and exits; `buildit wait
+`buildit build ... --mode job` prints the job name and exits; `buildit wait
 <job>` reattaches at any point — it follows builder logs across retries,
 then prints the digest-pinned ref (read from the termination message, with a
 registry manifest HEAD as fallback). Killing `wait` kills nothing.
 
-One piece of leftover state: `buildit-ctx-*` tags accumulate in the repo.
-They're tiny (your source tree, compressed by the registry) and
-content-addressed; prune them with your registry's UI/API or a lifecycle
-policy.
+Context images are labeled for self-pruning where the registry supports it:
+on quay registries buildit defaults to `quay.expires-after=2w` (override or
+extend with `--context-label`). Elsewhere the `buildit-ctx-*` tags are tiny
+and content-addressed; prune with your registry's lifecycle policy.
 
 ## Agent skill
 

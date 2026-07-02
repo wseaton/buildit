@@ -21,6 +21,31 @@ pub struct DetachArgs<'a> {
     pub ctx_ref: &'a str,
     pub authfile: &'a [u8],
     pub idle_nodes: &'a [String],
+    pub resources: &'a crate::backend::Resources,
+    pub labels: &'a [(String, String)],
+}
+
+pub fn secret_manifest(
+    name: &str,
+    namespace: &str,
+    authfile: &[u8],
+    owner: Option<OwnerReference>,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([("app".to_string(), "buildit".to_string())])),
+            owner_references: owner.map(|o| vec![o]),
+            ..Default::default()
+        },
+        type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+        data: Some(BTreeMap::from([(
+            ".dockerconfigjson".to_string(),
+            ByteString(authfile.to_vec()),
+        )])),
+        ..Default::default()
+    }
 }
 
 // job first, then the secret owner-ref'd to it: when ttlSecondsAfterFinished
@@ -35,15 +60,7 @@ pub async fn create(
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
     let name = pod::unique_name();
 
-    let spec = backend.job_spec(
-        &name,
-        namespace,
-        args.image,
-        args.dockerfile,
-        args.build_args,
-        args.ctx_ref,
-        args.idle_nodes,
-    )?;
+    let spec = backend.job_spec(&name, namespace, args)?;
     let created = jobs
         .create(&PostParams::default(), &spec)
         .await
@@ -53,27 +70,14 @@ pub async fn create(
         .uid
         .ok_or_else(|| anyhow!("created job has no uid"))?;
 
-    let secret = Secret {
-        metadata: ObjectMeta {
-            name: Some(name.clone()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(BTreeMap::from([("app".to_string(), "buildit".to_string())])),
-            owner_references: Some(vec![OwnerReference {
-                api_version: "batch/v1".to_string(),
-                kind: "Job".to_string(),
-                name: name.clone(),
-                uid,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        },
-        type_: Some("kubernetes.io/dockerconfigjson".to_string()),
-        data: Some(BTreeMap::from([(
-            ".dockerconfigjson".to_string(),
-            ByteString(args.authfile.to_vec()),
-        )])),
+    let owner = OwnerReference {
+        api_version: "batch/v1".to_string(),
+        kind: "Job".to_string(),
+        name: name.clone(),
+        uid,
         ..Default::default()
     };
+    let secret = secret_manifest(&name, namespace, args.authfile, Some(owner));
     if let Err(err) = secrets.create(&PostParams::default(), &secret).await {
         jobs.delete(&name, &DeleteParams::background()).await.ok();
         return Err(err).with_context(|| format!("creating auth secret {name}"));

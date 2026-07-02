@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::BuildArgs;
 use crate::pod::BuilderPod;
+use crate::{BuildArgs, Mode, Schedule};
 use crate::{auth, context, job, oci, schedule};
 
 // quay.io/foo:tag -> quay.io/foo@sha256:...
@@ -16,34 +16,42 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
     let authfile = auth::minimal_authfile(&registry)?;
 
     tracing::info!(
-        "context: {}  dockerfile: {}  ->  {}  (ns={}, backend={:?}, detach={})",
+        "context: {}  dockerfile: {}  ->  {}  (ns={}, backend={:?}, mode={:?})",
         args.context.display(),
         args.dockerfile,
         args.image,
         args.namespace,
         args.backend,
-        args.detach
+        args.mode
     );
 
-    let idle_nodes = if args.any_node {
-        Vec::new()
-    } else {
-        let nodes = schedule::idle_nodes(client.clone()).await;
-        tracing::info!(
-            "{} idle node(s) without GPU workloads, preferring them (best effort)",
-            nodes.len()
-        );
-        nodes
+    let idle_nodes = match args.schedule {
+        Schedule::Any => Vec::new(),
+        Schedule::Idle => {
+            let nodes = schedule::idle_nodes(client.clone()).await;
+            tracing::info!(
+                "{} idle node(s) without GPU workloads, preferring them (best effort)",
+                nodes.len()
+            );
+            nodes
+        }
     };
 
-    if args.detach {
+    if args.mode == Mode::Job {
         return detach(client, args, &registry, &authfile, &idle_nodes).await;
     }
 
     let tarball = context::tarball(&args.context)?;
     tracing::info!("context tarball: {} KiB", tarball.len() / 1024);
 
-    let pod = BuilderPod::create(client, &args.namespace, args.backend, &idle_nodes).await?;
+    let pod = BuilderPod::create(
+        client,
+        &args.namespace,
+        args.backend,
+        &idle_nodes,
+        &args.resources(),
+    )
+    .await?;
     tracing::info!("builder pod {} created, waiting for ready", pod.name);
 
     let outcome = tokio::select! {
@@ -77,7 +85,16 @@ async fn detach(
     let ctx_ref = oci::context_reference(&args.image, &tar);
     let (user, pass) = auth::basic_credentials(registry)?;
     let reg_auth = oci_client::secrets::RegistryAuth::Basic(user, pass);
-    oci::push_context(&ctx_ref, tar, &reg_auth).await?;
+    let ctx_labels = if args.context_labels.is_empty() {
+        let defaults = oci::default_context_labels(registry);
+        for (k, v) in &defaults {
+            tracing::info!("context label default for {registry}: {k}={v}");
+        }
+        defaults
+    } else {
+        args.context_labels.clone()
+    };
+    oci::push_context(&ctx_ref, tar, &reg_auth, &ctx_labels).await?;
 
     let job = job::create(
         client,
@@ -90,6 +107,8 @@ async fn detach(
             ctx_ref: &ctx_ref,
             authfile,
             idle_nodes,
+            resources: &args.resources(),
+            labels: &args.labels,
         },
     )
     .await?;
@@ -98,6 +117,47 @@ async fn detach(
         args.namespace
     );
     println!("{job}");
+    Ok(())
+}
+
+// --output render: print manifests as YAML, touch nothing
+pub fn render(args: &BuildArgs) -> Result<()> {
+    let name = crate::pod::unique_name();
+    let resources = args.resources();
+    match args.mode {
+        Mode::Pod => {
+            let pod = args
+                .backend
+                .pod_spec(&name, &args.namespace, &[], &resources)?;
+            print!("{}", serde_norway::to_string(&pod)?);
+        }
+        Mode::Job => {
+            let tar = context::tar_bytes(&args.context)?;
+            let ctx_ref = oci::context_reference(&args.image, &tar);
+            let spec = args.backend.job_spec(
+                &name,
+                &args.namespace,
+                &job::DetachArgs {
+                    image: &args.image,
+                    dockerfile: &args.dockerfile,
+                    build_args: &args.build_args,
+                    ctx_ref: &ctx_ref,
+                    authfile: b"",
+                    idle_nodes: &[],
+                    resources: &resources,
+                    labels: &args.labels,
+                },
+            )?;
+            tracing::info!("secret data redacted; a real run ships your registry token");
+            tracing::info!("a real run pushes the context to {ctx_ref} first");
+            let secret = job::secret_manifest(&name, &args.namespace, b"<redacted>", None);
+            print!(
+                "{}---\n{}",
+                serde_norway::to_string(&spec)?,
+                serde_norway::to_string(&secret)?
+            );
+        }
+    }
     Ok(())
 }
 
@@ -118,7 +178,12 @@ async fn drive(
         .await?;
 
     tracing::info!("building + pushing (this can take several minutes)");
-    for step in backend.build_steps(&args.image, &args.dockerfile, &args.build_args) {
+    for step in backend.build_steps(
+        &args.image,
+        &args.dockerfile,
+        &args.build_args,
+        &args.labels,
+    ) {
         pod.exec_stream(&step).await?;
     }
 
