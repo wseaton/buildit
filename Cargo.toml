@@ -1,6 +1,6 @@
 [package]
 name = "buildit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Build and push container images remotely on a Kubernetes cluster via unprivileged builder pods"
 license = "MIT"
