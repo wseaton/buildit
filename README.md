@@ -19,6 +19,18 @@ Kubernetes exec API, builds + pushes, prints the digest, and deletes the pod.
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64, arm64) and macOS (arm64, x86_64) are on
+the [releases page](https://github.com/wseaton/buildit/releases):
+
+```sh
+# pick your target: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu,
+#                   aarch64-apple-darwin, x86_64-apple-darwin
+curl -fsSL https://github.com/wseaton/buildit/releases/latest/download/buildit-aarch64-apple-darwin.tar.gz \
+  | tar -xz -C ~/.local/bin
+```
+
+Or build from source:
+
 ```sh
 cargo install --git https://github.com/wseaton/buildit
 ```
