@@ -51,6 +51,21 @@ always excluded.
 Builds can take several minutes (base image pull + full compile); the
 builder's output streams live to the terminal.
 
+## Options worth knowing
+
+- `--mode pod|job` (default pod): pod = interactive exec-driven build;
+  job = detached Kubernetes Job, reattach with `buildit wait <job>`.
+- `--output apply|render` (default apply): render prints the manifests as
+  YAML to stdout without touching the cluster or registry.
+- `--schedule idle|any` (default idle): idle prefers nodes with no GPU
+  workloads (best effort).
+- `--request KEY=QTY` / `--limit KEY=QTY` (repeatable): builder container
+  resources, e.g. `--request cpu=4 --request memory=8Gi --limit memory=16Gi`.
+- `--label KEY=VALUE` (repeatable): labels on the built image.
+- `--context-label KEY=VALUE` (repeatable, job mode): labels on the pushed
+  context image. Defaults to `quay.expires-after=2w` on quay registries so
+  `buildit-ctx-*` tags self-prune; passing any --context-label overrides.
+
 ## Backends
 
 `--backend buildkit` (default) | `kaniko` | `buildah`. All unprivileged.
