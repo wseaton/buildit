@@ -29,12 +29,11 @@ impl BuilderPod {
         client: kube::Client,
         namespace: &str,
         backend: Backend,
-        idle_nodes: &[String],
-        resources: &crate::backend::Resources,
+        opts: &crate::backend::PodOpts<'_>,
     ) -> Result<Self> {
         let pods: Api<Pod> = Api::namespaced(client, namespace);
         let name = unique_name();
-        let spec = backend.pod_spec(&name, namespace, idle_nodes, resources)?;
+        let spec = backend.pod_spec(&name, namespace, opts)?;
         pods.create(&PostParams::default(), &spec)
             .await
             .with_context(|| format!("creating pod {name} in {namespace}"))?;
@@ -143,6 +142,44 @@ impl BuilderPod {
             .with_context(|| format!("deleting pod {}", self.name))?;
         Ok(())
     }
+}
+
+// get-or-create the cache PVC; existing claims are used as-is
+pub async fn ensure_pvc(
+    client: kube::Client,
+    namespace: &str,
+    name: &str,
+    size: &str,
+) -> Result<()> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
+    if pvcs
+        .get_opt(name)
+        .await
+        .context("checking cache PVC")?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let claim: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": { "app": "buildit", "buildit/cache": "true" }
+        },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": { "requests": { "storage": size } }
+        }
+    }))
+    .context("building PVC spec")?;
+    pvcs.create(&PostParams::default(), &claim)
+        .await
+        .with_context(|| format!("creating cache PVC {name}"))?;
+    tracing::info!("created cache PVC {name} ({size})");
+    Ok(())
 }
 
 pub async fn clean(client: kube::Client, namespace: &str) -> Result<usize> {

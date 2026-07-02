@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Build and push an image via an unprivileged builder pod
-    Build(BuildArgs),
+    Build(Box<BuildArgs>),
     /// Wait for a detached build Job and print its digest-pinned ref
     Wait {
         /// Job name printed by `build --detach`
@@ -84,6 +84,23 @@ pub struct BuildArgs {
     /// Resource limits for the builder container, repeatable: --limit cpu=8 --limit memory=16Gi
     #[arg(long = "limit", value_name = "KEY=QTY", value_parser = parse_kv)]
     pub limits: Vec<(String, String)>,
+    /// Name of a PersistentVolumeClaim to mount as the builder's cache
+    /// (created if missing, labeled app=buildit). Persists layer/store cache
+    /// across builds. RWO caveat: concurrent builds contend for the volume.
+    #[arg(long, value_name = "PVC_NAME", conflicts_with = "cache_hostpath")]
+    pub cache_pvc: Option<String>,
+    /// Size for the cache PVC when buildit has to create it
+    #[arg(long, value_name = "QTY", default_value = "20Gi")]
+    pub cache_size: String,
+    /// Node-local directory to mount as the builder's cache (hostPath,
+    /// DirectoryOrCreate). Fast on NVMe-backed nodes; pair with --node so
+    /// consecutive builds land on the same cache.
+    #[arg(long, value_name = "PATH", conflicts_with = "cache_pvc")]
+    pub cache_hostpath: Option<String>,
+    /// Pin the builder to a specific node (nodeSelector on hostname).
+    /// Overrides --schedule.
+    #[arg(long, value_name = "NODE")]
+    pub node: Option<String>,
     /// Labels for the built image, repeatable: --label team=infra
     #[arg(long = "label", value_name = "KEY=VALUE", value_parser = parse_kv)]
     pub labels: Vec<(String, String)>,
@@ -136,6 +153,14 @@ impl BuildArgs {
         backend::Resources {
             requests: self.requests.clone(),
             limits: self.limits.clone(),
+        }
+    }
+
+    fn cache(&self) -> Option<backend::CacheVolume<'_>> {
+        match (&self.cache_pvc, &self.cache_hostpath) {
+            (Some(pvc), _) => Some(backend::CacheVolume::Pvc(pvc)),
+            (_, Some(path)) => Some(backend::CacheVolume::HostPath(path)),
+            _ => None,
         }
     }
 }

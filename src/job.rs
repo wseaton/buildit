@@ -23,6 +23,8 @@ pub struct DetachArgs<'a> {
     pub idle_nodes: &'a [String],
     pub resources: &'a crate::backend::Resources,
     pub labels: &'a [(String, String)],
+    pub cache: Option<crate::backend::CacheVolume<'a>>,
+    pub node: Option<&'a str>,
 }
 
 pub fn secret_manifest(

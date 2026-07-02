@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::pod::BuilderPod;
 use crate::{BuildArgs, Mode, Schedule};
-use crate::{auth, context, job, oci, schedule};
+use crate::{auth, backend, context, job, oci, pod, schedule};
 
 // quay.io/foo:tag -> quay.io/foo@sha256:...
 pub(crate) fn pinned_ref(image: &str, digest: &str) -> String {
@@ -25,9 +25,10 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
         args.mode
     );
 
-    let idle_nodes = match args.schedule {
-        Schedule::Any => Vec::new(),
-        Schedule::Idle => {
+    let idle_nodes = match (args.node.as_deref(), args.schedule) {
+        // explicit pin makes the scout pointless
+        (Some(_), _) | (None, Schedule::Any) => Vec::new(),
+        (None, Schedule::Idle) => {
             let nodes = schedule::idle_nodes(client.clone()).await;
             tracing::info!(
                 "{} idle node(s) without GPU workloads, preferring them (best effort)",
@@ -37,6 +38,10 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
         }
     };
 
+    if let Some(backend::CacheVolume::Pvc(name)) = args.cache() {
+        pod::ensure_pvc(client.clone(), &args.namespace, name, &args.cache_size).await?;
+    }
+
     if args.mode == Mode::Job {
         return detach(client, args, &registry, &authfile, &idle_nodes).await;
     }
@@ -44,14 +49,14 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
     let tarball = context::tarball(&args.context)?;
     tracing::info!("context tarball: {} KiB", tarball.len() / 1024);
 
-    let pod = BuilderPod::create(
-        client,
-        &args.namespace,
-        args.backend,
-        &idle_nodes,
-        &args.resources(),
-    )
-    .await?;
+    let resources = args.resources();
+    let opts = backend::PodOpts {
+        idle_nodes: &idle_nodes,
+        resources: &resources,
+        cache: args.cache(),
+        node: args.node.as_deref(),
+    };
+    let pod = BuilderPod::create(client, &args.namespace, args.backend, &opts).await?;
     tracing::info!("builder pod {} created, waiting for ready", pod.name);
 
     let outcome = tokio::select! {
@@ -109,6 +114,8 @@ async fn detach(
             idle_nodes,
             resources: &args.resources(),
             labels: &args.labels,
+            cache: args.cache(),
+            node: args.node.as_deref(),
         },
     )
     .await?;
@@ -126,9 +133,13 @@ pub fn render(args: &BuildArgs) -> Result<()> {
     let resources = args.resources();
     match args.mode {
         Mode::Pod => {
-            let pod = args
-                .backend
-                .pod_spec(&name, &args.namespace, &[], &resources)?;
+            let opts = backend::PodOpts {
+                idle_nodes: &[],
+                resources: &resources,
+                cache: args.cache(),
+                node: args.node.as_deref(),
+            };
+            let pod = args.backend.pod_spec(&name, &args.namespace, &opts)?;
             print!("{}", serde_norway::to_string(&pod)?);
         }
         Mode::Job => {
@@ -146,6 +157,8 @@ pub fn render(args: &BuildArgs) -> Result<()> {
                     idle_nodes: &[],
                     resources: &resources,
                     labels: &args.labels,
+                    cache: args.cache(),
+                    node: args.node.as_deref(),
                 },
             )?;
             tracing::info!("secret data redacted; a real run ships your registry token");

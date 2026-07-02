@@ -61,6 +61,11 @@ builder's output streams live to the terminal.
   workloads (best effort).
 - `--request KEY=QTY` / `--limit KEY=QTY` (repeatable): builder container
   resources, e.g. `--request cpu=4 --request memory=8Gi --limit memory=16Gi`.
+- `--cache-pvc NAME` / `--cache-hostpath PATH`: persistent build cache
+  (PVC auto-created; hostPath is node-local NVMe, pair with `--node`).
+  NFS-backed PVCs don't work with rootless buildkit/buildah (chown); kaniko
+  is fine on anything.
+- `--node NAME`: pin the builder to a node (disables the idle scout).
 - `--label KEY=VALUE` (repeatable): labels on the built image.
 - `--context-label KEY=VALUE` (repeatable, job mode): labels on the pushed
   context image. Defaults to `quay.expires-after=2w` on quay registries so

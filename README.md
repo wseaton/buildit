@@ -126,6 +126,54 @@ on quay registries buildit defaults to `quay.expires-after=2w` (override or
 extend with `--context-label`). Elsewhere the `buildit-ctx-*` tags are tiny
 and content-addressed; prune with your registry's lifecycle policy.
 
+## How it compares
+
+- **`docker buildx` (kubernetes driver)** — the closest relative. It keeps a
+  persistent buildkitd Deployment in your cluster, which buys a warm build
+  cache but costs you a daemon to manage; it's buildkit-only, and the build
+  dies with your connection. buildit's pods are ephemeral, backends are
+  pluggable, and `--mode job` survives disconnects.
+- **Shipwright** — k8s-native builds with pluggable strategies, but it's an
+  operator: CRDs, controllers, cluster-admin buy-in. buildit needs nothing
+  installed in the cluster, just RBAC to create pods.
+- **OpenShift binary builds** (`oc start-build --from-dir`) — nearly the same
+  UX, OpenShift-only.
+- **Skaffold's kaniko builder** — same ephemeral-pod mechanism, but embedded
+  in a dev-loop tool rather than a standalone CLI.
+- **img, makisu, kim, kubectl-build** — the same idea, all archived.
+- **Depot.dev** — this experience as SaaS, on their hardware instead of your
+  cluster.
+
+The trade for ephemeral builders is a cold cache per build; `--cache-pvc`
+(below) claws that back with a persistent volume.
+
+## Caching
+
+Ephemeral builders start cold. Two ways to fix that:
+
+```sh
+# node-local NVMe (the CoreWeave play): pin + hostPath, fastest option
+buildit build quay.io/acme/foo:tag --node gpu-node-7 --cache-hostpath /mnt/nvme/buildit-cache
+
+# cluster storage: PVC, auto-created if missing (RWO: one build at a time)
+buildit build quay.io/acme/foo:tag --cache-pvc buildit-cache --cache-size 50Gi
+```
+
+The cache mounts at each backend's natural location: buildkit's store,
+buildah's containers storage, kaniko's `--cache-dir` (kaniko also gets
+`--cache=true`, so RUN-layer cache goes to the registry). In testing, a
+25-second RUN step went from 25s to `CACHED` with a node-local hostPath.
+
+Compatibility note: rootless buildkit's snapshotter needs chown support from
+the filesystem, so NFS-flavored storage classes (VAST, EFS, etc.) fail with
+`lchown ... operation not permitted` — use `--cache-hostpath` or a
+block-backed storage class for buildkit/buildah. kaniko's file cache works on
+anything. The build *workspace* always stays on an `emptyDir`, which is
+node-local disk (NVMe on CoreWeave) — only the cache needs a home.
+
+`--node` pins via nodeSelector and disables the idle-node scout; hostPath
+caches only exist on their node, so keep the pair together.
+
 ## Agent skill
 
 [`skills/buildit/`](skills/buildit/SKILL.md) ships an

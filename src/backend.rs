@@ -3,6 +3,20 @@ use clap::ValueEnum;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 
+#[derive(Clone, Copy)]
+pub enum CacheVolume<'a> {
+    Pvc(&'a str),
+    // node-local NVMe, the coreweave speed play; pair with PodOpts.node
+    HostPath(&'a str),
+}
+
+pub struct PodOpts<'a> {
+    pub idle_nodes: &'a [String],
+    pub resources: &'a Resources,
+    pub cache: Option<CacheVolume<'a>>,
+    pub node: Option<&'a str>,
+}
+
 #[derive(Default)]
 pub struct Resources {
     pub requests: Vec<(String, String)>,
@@ -234,13 +248,26 @@ impl Backend {
         }
     }
 
-    pub fn pod_spec(
-        &self,
-        name: &str,
-        namespace: &str,
-        idle_nodes: &[String],
-        resources: &Resources,
-    ) -> Result<Pod> {
+    // where a persistent cache volume pays off for each backend
+    fn cache_mount_path(&self) -> &'static str {
+        match self {
+            Backend::Buildkit => "/home/user/.local/share/buildkit",
+            // kaniko caches base images under --cache-dir
+            Backend::Kaniko => "/cache",
+            Backend::Buildah => "/home/build/.local/share/containers",
+        }
+    }
+
+    // volume named for the mount it replaces; kaniko gets a dedicated one
+    fn cache_volume_name(&self) -> &'static str {
+        match self {
+            Backend::Buildkit => "buildkit-storage",
+            Backend::Kaniko => "kaniko-cache",
+            Backend::Buildah => "containers-storage",
+        }
+    }
+
+    pub fn pod_spec(&self, name: &str, namespace: &str, opts: &PodOpts<'_>) -> Result<Pod> {
         let mut container = match self {
             Backend::Buildkit => serde_json::json!({
                 "name": "builder",
@@ -288,10 +315,10 @@ impl Backend {
                 }]
             }),
         };
-        if let Some(res) = resources.json() {
+        if let Some(res) = opts.resources.json() {
             container["resources"] = res;
         }
-        let volumes = match self {
+        let mut volumes = match self {
             Backend::Buildkit => {
                 serde_json::json!([{ "name": "buildkit-storage", "emptyDir": {} }])
             }
@@ -300,6 +327,9 @@ impl Backend {
                 serde_json::json!([{ "name": "containers-storage", "emptyDir": {} }])
             }
         };
+        if let Some(cache) = opts.cache {
+            self.apply_cache(&mut container, &mut volumes, cache);
+        }
         let mut spec = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -321,7 +351,18 @@ impl Backend {
                 "volumes": volumes
             }
         });
-        if !idle_nodes.is_empty() {
+        if matches!(opts.cache, Some(CacheVolume::Pvc(_))) {
+            // fresh PVC filesystems are root:root 0755 (unlike 0777 emptyDirs);
+            // fsGroup lets the uid-1000 builders write to them
+            spec["spec"]["securityContext"] = serde_json::json!({ "fsGroup": 1000 });
+        }
+        if let Some(init) = self.cache_perm_fix(opts.cache) {
+            spec["spec"]["initContainers"] = serde_json::json!([init]);
+        }
+        if let Some(node) = opts.node {
+            spec["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": node });
+        }
+        if !opts.idle_nodes.is_empty() {
             spec["spec"]["affinity"] = serde_json::json!({
                 "nodeAffinity": {
                     "preferredDuringSchedulingIgnoredDuringExecution": [{
@@ -330,7 +371,7 @@ impl Backend {
                             "matchExpressions": [{
                                 "key": "kubernetes.io/hostname",
                                 "operator": "In",
-                                "values": idle_nodes
+                                "values": opts.idle_nodes
                             }]
                         }
                     }]
@@ -338,6 +379,73 @@ impl Backend {
             });
         }
         serde_json::from_value(spec).context("building pod spec")
+    }
+
+    // point the backend's cache volume at the PVC or hostPath; for kaniko
+    // also add the mount (it has no storage volume otherwise) and cache flags
+    fn apply_cache(
+        &self,
+        container: &mut serde_json::Value,
+        volumes: &mut serde_json::Value,
+        cache: CacheVolume<'_>,
+    ) {
+        let vol_name = self.cache_volume_name();
+        let source = match cache {
+            CacheVolume::Pvc(name) => {
+                serde_json::json!({ "persistentVolumeClaim": { "claimName": name } })
+            }
+            CacheVolume::HostPath(path) => {
+                serde_json::json!({ "hostPath": { "path": path, "type": "DirectoryOrCreate" } })
+            }
+        };
+        let vols = volumes.as_array_mut().expect("volumes is a json array");
+        vols.retain(|v| v["name"] != vol_name);
+        let mut vol = serde_json::json!({ "name": vol_name });
+        for (k, v) in source.as_object().expect("source is a json object") {
+            vol[k] = v.clone();
+        }
+        vols.push(vol);
+        if let Backend::Kaniko = self {
+            let mounts = container["volumeMounts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let mut mounts = mounts;
+            mounts.push(serde_json::json!({
+                "name": vol_name,
+                "mountPath": self.cache_mount_path()
+            }));
+            container["volumeMounts"] = serde_json::json!(mounts);
+            // kaniko: cache-dir holds base images; layer cache goes to the
+            // registry (push failures there are warnings, not errors)
+            if let Some(cmd) = container["command"].as_array_mut() {
+                cmd.push(serde_json::json!("--cache=true"));
+                cmd.push(serde_json::json!(format!(
+                    "--cache-dir={}",
+                    self.cache_mount_path()
+                )));
+            }
+        }
+    }
+
+    // hostPath dirs come up root:root 0755 and fsGroup doesn't touch them,
+    // so rootless builders need a one-shot chmod before they can write
+    fn cache_perm_fix(&self, cache: Option<CacheVolume<'_>>) -> Option<serde_json::Value> {
+        match (cache, self) {
+            (Some(CacheVolume::HostPath(_)), Backend::Buildkit | Backend::Buildah) => {
+                Some(serde_json::json!({
+                    "name": "fix-cache-perms",
+                    "image": "busybox:1.36",
+                    "command": ["chmod", "1777", self.cache_mount_path()],
+                    "securityContext": { "runAsUser": 0, "runAsGroup": 0 },
+                    "volumeMounts": [{
+                        "name": self.cache_volume_name(),
+                        "mountPath": self.cache_mount_path()
+                    }]
+                }))
+            }
+            _ => None,
+        }
     }
 
     // job mode: build runs as the container command with context staged by an
@@ -472,7 +580,8 @@ impl Backend {
         if let Some(res) = args.resources.json() {
             builder["resources"] = res;
         }
-        let mut backend_volumes = match self {
+
+        let mut backend_volumes = serde_json::json!(match self {
             Backend::Buildkit => {
                 vec![serde_json::json!({ "name": "buildkit-storage", "emptyDir": {} })]
             }
@@ -480,7 +589,10 @@ impl Backend {
             Backend::Buildah => {
                 vec![serde_json::json!({ "name": "containers-storage", "emptyDir": {} })]
             }
-        };
+        });
+        if let Some(cache) = args.cache {
+            self.apply_cache(&mut builder, &mut backend_volumes, cache);
+        }
         let mut volumes = vec![
             serde_json::json!({ "name": "workspace", "emptyDir": {} }),
             serde_json::json!({
@@ -491,7 +603,9 @@ impl Backend {
                 }
             }),
         ];
-        volumes.append(&mut backend_volumes);
+        if let Some(extra) = backend_volumes.as_array() {
+            volumes.extend(extra.iter().cloned());
+        }
         let mut spec = serde_json::json!({
             "apiVersion": "batch/v1",
             "kind": "Job",
@@ -537,6 +651,16 @@ impl Backend {
                 }
             }
         });
+        if let Some(init) = self.cache_perm_fix(args.cache) {
+            let inits = spec["spec"]["template"]["spec"]["initContainers"]
+                .as_array_mut()
+                .expect("job template has initContainers");
+            inits.insert(0, init);
+        }
+        if let Some(node) = args.node {
+            spec["spec"]["template"]["spec"]["nodeSelector"] =
+                serde_json::json!({ "kubernetes.io/hostname": node });
+        }
         if !args.idle_nodes.is_empty() {
             spec["spec"]["template"]["spec"]["affinity"] = serde_json::json!({
                 "nodeAffinity": {
@@ -648,6 +772,8 @@ mod tests {
                         idle_nodes: &["node-a".to_string()],
                         resources: &resources,
                         labels: &[("team".to_string(), "infra".to_string())],
+                        cache: Some(crate::backend::CacheVolume::HostPath("/mnt/nvme/c")),
+                        node: Some("nvme-node-1"),
                     },
                 )
                 .unwrap();
@@ -661,8 +787,17 @@ mod tests {
                 Some(1000),
                 "uid-1000 builders need the emptyDir group-writable"
             );
-            let init = &pod_spec.init_containers.unwrap()[0];
-            assert_eq!(init.name, "fetch-context");
+            let inits = pod_spec.init_containers.unwrap();
+            assert!(inits.iter().any(|c| c.name == "fetch-context"));
+            assert_eq!(
+                inits.iter().any(|c| c.name == "fix-cache-perms"),
+                backend != Backend::Kaniko,
+                "{backend:?}"
+            );
+            assert_eq!(
+                pod_spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
+                "nvme-node-1"
+            );
             let builder = &pod_spec.containers[0];
             assert_eq!(builder.name, "builder");
             assert_eq!(
@@ -703,6 +838,72 @@ mod tests {
         assert!(Backend::Kaniko.digest_from("garbage").is_err());
     }
 
+    fn opts<'a>(idle_nodes: &'a [String], resources: &'a Resources) -> crate::backend::PodOpts<'a> {
+        crate::backend::PodOpts {
+            idle_nodes,
+            resources,
+            cache: None,
+            node: None,
+        }
+    }
+
+    #[test]
+    fn pod_spec_cache_and_node_pinning() {
+        let empty = Resources::default();
+        for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
+            let pvc_opts = crate::backend::PodOpts {
+                cache: Some(crate::backend::CacheVolume::Pvc("build-cache")),
+                node: Some("nvme-node-1"),
+                ..opts(&[], &empty)
+            };
+            let pod = backend
+                .pod_spec("buildit-abc123", "builds", &pvc_opts)
+                .unwrap();
+            let spec = pod.spec.unwrap();
+            assert_eq!(
+                spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
+                "nvme-node-1"
+            );
+            let vols = spec.volumes.unwrap();
+            assert!(
+                vols.iter().any(|v| v
+                    .persistent_volume_claim
+                    .as_ref()
+                    .is_some_and(|c| c.claim_name == "build-cache")),
+                "{backend:?} missing pvc volume"
+            );
+
+            let hp_opts = crate::backend::PodOpts {
+                cache: Some(crate::backend::CacheVolume::HostPath("/mnt/nvme/cache")),
+                ..opts(&[], &empty)
+            };
+            let pod = backend
+                .pod_spec("buildit-abc123", "builds", &hp_opts)
+                .unwrap();
+            let spec = pod.spec.unwrap();
+            let vols = spec.volumes.unwrap();
+            assert!(
+                vols.iter().any(|v| v
+                    .host_path
+                    .as_ref()
+                    .is_some_and(|h| h.path == "/mnt/nvme/cache")),
+                "{backend:?} missing hostPath volume"
+            );
+            // rootless backends need the chmod init; kaniko runs as root
+            let has_fix = spec
+                .init_containers
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.name == "fix-cache-perms");
+            assert_eq!(has_fix, backend != Backend::Kaniko, "{backend:?}");
+            if backend == Backend::Kaniko {
+                let cmd = spec.containers[0].command.as_deref().unwrap_or_default();
+                assert!(cmd.iter().any(|a| a == "--cache=true"), "{cmd:?}");
+            }
+        }
+    }
+
     #[test]
     fn pod_specs_deserialize_with_and_without_affinity() {
         let cpu2 = crate::backend::Resources {
@@ -711,7 +912,7 @@ mod tests {
         };
         for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
             let pod = backend
-                .pod_spec("buildit-abc123", "builds", &[], &cpu2)
+                .pod_spec("buildit-abc123", "builds", &opts(&[], &cpu2))
                 .unwrap();
             let res = pod.spec.as_ref().unwrap().containers[0]
                 .resources
@@ -727,8 +928,9 @@ mod tests {
             assert_eq!(labels.get("app").map(String::as_str), Some("buildit"));
 
             let idle = vec!["node-a".to_string(), "node-b".to_string()];
+            let none = Resources::default();
             let pod = backend
-                .pod_spec("buildit-abc123", "builds", &idle, &Resources::default())
+                .pod_spec("buildit-abc123", "builds", &opts(&idle, &none))
                 .unwrap();
             let affinity = pod.spec.unwrap().affinity.unwrap();
             let prefs = affinity
