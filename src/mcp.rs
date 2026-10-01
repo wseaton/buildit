@@ -402,18 +402,21 @@ fn pod_name(pod: &Pod) -> &str {
     pod.metadata.name.as_deref().unwrap_or_default()
 }
 
-// oldest first, ties by name
+// pods created in the same second as `id` count as older
 fn within_cap(live: &[Pod], cap: usize, id: &BuildId) -> bool {
-    let mut ranked: Vec<&Pod> = live.iter().collect();
-    ranked.sort_by(|a, b| {
-        let at = a.metadata.creation_timestamp.as_ref().map(|t| t.0);
-        let bt = b.metadata.creation_timestamp.as_ref().map(|t| t.0);
-        at.cmp(&bt).then_with(|| pod_name(a).cmp(pod_name(b)))
-    });
-    ranked
+    let created = |p: &Pod| p.metadata.creation_timestamp.as_ref().map(|t| t.0);
+    let Some(me) = live
         .iter()
-        .position(|p| label(p, LABEL_BUILD_ID) == Some(id.as_str()))
-        .is_some_and(|i| i < cap)
+        .find(|p| label(p, LABEL_BUILD_ID) == Some(id.as_str()))
+    else {
+        return false;
+    };
+    let mine = created(me);
+    let older = live
+        .iter()
+        .filter(|p| label(p, LABEL_BUILD_ID) != Some(id.as_str()) && created(p) <= mine)
+        .count();
+    older < cap
 }
 
 fn pod_labels(caller: &SandboxName, id: &BuildId) -> Vec<(String, String)> {
@@ -1499,6 +1502,23 @@ mod tests {
         assert!(within_cap(&live, 3, &id("buildit-c")));
         assert!(!within_cap(&live, 3, &id("buildit-z")));
         assert_eq!(LABEL_BUILD_ID, "buildit.dev/build-id");
+
+        // two builds racing in one second: neither may count on being first
+        let racing = [
+            pod("buildit-y", "sb-a", "2026-10-01T10:00:07Z", None),
+            pod("buildit-x", "sb-a", "2026-10-01T10:00:07Z", None),
+        ];
+        assert!(!within_cap(&racing, 1, &id("buildit-x")));
+        assert!(!within_cap(&racing, 1, &id("buildit-y")));
+        assert!(within_cap(&racing, 2, &id("buildit-y")));
+        // the one that listed before the other existed goes ahead
+        assert!(within_cap(&racing[1..], 1, &id("buildit-x")));
+        let earlier = [
+            pod("buildit-y", "sb-a", "2026-10-01T10:00:08Z", None),
+            pod("buildit-x", "sb-a", "2026-10-01T10:00:07Z", None),
+        ];
+        assert!(within_cap(&earlier, 1, &id("buildit-x")));
+        assert!(!within_cap(&earlier, 1, &id("buildit-y")));
     }
 
     fn broker(workspace: Workspace) -> Arc<Broker> {
