@@ -41,7 +41,7 @@ cargo install --git https://github.com/wseaton/buildit
 buildit build quay.io/acme/foo:tag                 # context=., Dockerfile, current kubecontext
 buildit build quay.io/acme/foo:tag \
   -f Dockerfile.prod -c ./svc -n builds \
-  --backend buildah --build-arg FOO=bar
+  --backend buildah --build-arg FOO=bar --target runtime
 JOB=$(buildit build quay.io/acme/foo:tag --mode job | tail -1)   # fire and forget
 buildit wait $JOB                                  # reattach anytime, prints the digest
 buildit build quay.io/acme/foo:tag \
@@ -125,6 +125,36 @@ Context images are labeled for self-pruning where the registry supports it:
 on quay registries buildit defaults to `quay.expires-after=2w` (override or
 extend with `--context-label`). Elsewhere the `buildit-ctx-*` tags are tiny
 and content-addressed; prune with your registry's lifecycle policy.
+
+## MCP server
+
+`buildit mcp` serves `build`, `run`, and `clean` as MCP tools over
+streamable http, for an agent in a sandbox that can't build images itself
+(it runs as a crucible `[agent.broker]` on the loop pod).
+
+- `build` pulls a workspace subdirectory out of the sandbox
+  (`openshell sandbox download`), builds it without pushing, and keeps the
+  builder pod alive. The full log lands at `.buildit/<build_id>/build.log`.
+- `run` starts a fresh container of a built image (buildah backend), runs a
+  command, and copies `fetch_paths` back to `.buildit/<build_id>/<path>`.
+  Only regular files and directories come back.
+- `clean` deletes builder pods.
+
+Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
+`X-Crucible-Sandbox` header naming the sandbox. `Host` must be loopback,
+`host.openshell.internal`, `host.containers.internal`, or listed in
+`BROKER_ALLOWED_HOSTS`. The context must be a subdirectory, symlinks are
+refused, and `.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube`, `.jira` are
+never shipped. Builder pods get no service account token, no service links,
+an `activeDeadlineSeconds`, and an ownerReference to the serving pod.
+
+```sh
+# in-cluster (namespace from the service account)
+BROKER_TOKEN=... BROKER_SANDBOX_WORKDIR=/sandbox/repo buildit mcp
+# off-cluster dev: a local dir stands in for the sandbox
+BROKER_TOKEN=dev buildit mcp --local-workdir . --kubecontext kind-dev -n default \
+  --bind 127.0.0.1:8849
+```
 
 ## How it compares
 

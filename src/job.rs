@@ -12,11 +12,13 @@ use kube::api::{Api, DeleteParams, ListParams, LogParams, ObjectMeta, PostParams
 
 use crate::backend::Backend;
 use crate::build::pinned_ref;
+use crate::pod::LogSink;
 use crate::{auth, oci, pod};
 
 pub struct DetachArgs<'a> {
     pub image: &'a str,
     pub dockerfile: &'a str,
+    pub target: Option<&'a str>,
     pub build_args: &'a [String],
     pub ctx_ref: &'a str,
     pub authfile: &'a [u8],
@@ -118,9 +120,14 @@ fn job_state(job: &Job) -> JobState {
     JobState::Running
 }
 
-// waits for the job, following builder logs across retries, then prints the
+// waits for the job, following builder logs across retries, then returns the
 // digest-pinned ref. safe to kill and rerun; it drives nothing.
-pub async fn wait(client: kube::Client, namespace: &str, job_name: &str) -> Result<()> {
+pub async fn wait(
+    client: kube::Client,
+    namespace: &str,
+    job_name: &str,
+    sink: &mut LogSink,
+) -> Result<String> {
     let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
     let pods: Api<Pod> = Api::namespaced(client, namespace);
     let mut streamed: HashSet<String> = HashSet::new();
@@ -147,7 +154,7 @@ pub async fn wait(client: kube::Client, namespace: &str, job_name: &str) -> Resu
             }
             JobState::Running => {}
         }
-        follow_new_pod_logs(&pods, job_name, &mut streamed).await;
+        follow_new_pod_logs(&pods, job_name, &mut streamed, sink).await?;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
@@ -162,8 +169,7 @@ pub async fn wait(client: kube::Client, namespace: &str, job_name: &str) -> Resu
         }
     };
     tracing::info!("pushed {image}");
-    println!("{}", pinned_ref(&image, &digest));
-    Ok(())
+    Ok(pinned_ref(&image, &digest))
 }
 
 fn backend_of(job: &Job) -> Result<Backend> {
@@ -189,7 +195,12 @@ async fn job_pods(pods: &Api<Pod>, job_name: &str) -> Vec<Pod> {
 }
 
 // each pod's logs get followed exactly once, so a retry pod picks up cleanly
-async fn follow_new_pod_logs(pods: &Api<Pod>, job_name: &str, streamed: &mut HashSet<String>) {
+async fn follow_new_pod_logs(
+    pods: &Api<Pod>,
+    job_name: &str,
+    streamed: &mut HashSet<String>,
+    sink: &mut LogSink,
+) -> Result<()> {
     for p in job_pods(pods, job_name).await {
         let Some(name) = p.metadata.name else {
             continue;
@@ -209,9 +220,11 @@ async fn follow_new_pod_logs(pods: &Api<Pod>, job_name: &str, streamed: &mut Has
         tracing::info!("following logs of pod {name}");
         let mut lines = stream.lines();
         while let Ok(Some(line)) = lines.try_next().await {
-            println!("{line}");
+            sink.line(&line).await?;
         }
+        sink.flush().await?;
     }
+    Ok(())
 }
 
 async fn termination_message(pods: &Api<Pod>, job_name: &str) -> Option<String> {

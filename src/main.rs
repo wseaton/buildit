@@ -3,8 +3,10 @@ mod backend;
 mod build;
 mod context;
 mod job;
+mod mcp;
 mod oci;
 mod pod;
+mod sandbox;
 mod schedule;
 
 use std::path::PathBuf;
@@ -13,6 +15,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::backend::Backend;
+use crate::pod::LogSink;
 
 #[derive(Parser)]
 #[command(
@@ -39,6 +42,9 @@ enum Cmd {
         #[arg(long)]
         kubecontext: Option<String>,
     },
+    /// Serve build/run/clean as MCP tools over streamable http (a crucible
+    /// [agent.broker]); needs BROKER_TOKEN
+    Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {
         #[arg(short, long, default_value = "default", env = "BUILDIT_NAMESPACE")]
@@ -55,6 +61,9 @@ pub struct BuildArgs {
     pub image: String,
     #[arg(short = 'f', long, default_value = "Dockerfile")]
     pub dockerfile: String,
+    /// Multi-stage target to build
+    #[arg(long)]
+    pub target: Option<String>,
     /// Build context directory
     #[arg(short, long, default_value = ".")]
     pub context: PathBuf,
@@ -141,7 +150,7 @@ pub enum Schedule {
     Any,
 }
 
-fn parse_kv(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .filter(|(k, v)| !k.is_empty() && !v.is_empty())
@@ -206,10 +215,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Build(args) => match args.output {
-            Output::Render => build::render(&args),
+            Output::Render => {
+                print!("{}", build::render(&args)?);
+                Ok(())
+            }
             Output::Apply => {
                 let client = client_for(args.kubecontext.as_deref()).await?;
-                build::run(client, &args).await
+                let out = build::run(client, &args, &mut LogSink::terminal()).await?;
+                println!("{out}");
+                Ok(())
             }
         },
         Cmd::Wait {
@@ -218,8 +232,11 @@ async fn main() -> Result<()> {
             kubecontext,
         } => {
             let client = client_for(kubecontext.as_deref()).await?;
-            job::wait(client, &namespace, &job).await
+            let pinned = job::wait(client, &namespace, &job, &mut LogSink::terminal()).await?;
+            println!("{pinned}");
+            Ok(())
         }
+        Cmd::Mcp(args) => mcp::serve(*args).await,
         Cmd::Clean {
             namespace,
             kubecontext,
