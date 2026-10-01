@@ -44,7 +44,7 @@ enum Cmd {
         kubecontext: Option<String>,
     },
     /// Serve build/run/logs/clean as stateless MCP tools over streamable
-    /// http (a crucible [agent.broker]); needs BROKER_TOKEN
+    /// http (a crucible MCP server); callers come from MCP_TOKENS_FILE
     Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {

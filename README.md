@@ -160,9 +160,13 @@ ownerReference to the top of the serving pod's controller chain, e.g. its
 Deployment, which takes `get` on that chain's kinds), at `--pod-deadline`, or
 on `clean`. Pods that end at the deadline are deleted by the next `build`.
 
-Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
-`X-Crucible-Sandbox` header naming the sandbox; a build is only visible to the
-sandbox that made it. `Host` must be loopback, `host.openshell.internal`,
+Callers are identified by the bearer token alone. `MCP_TOKENS_FILE` names a
+file of `<token> <sandbox> [<workdir>]` lines (crucible writes it), re-read on
+every request; the matching line gives the caller's sandbox and the sandbox
+path its context is downloaded from and its results uploaded to. A line
+without a workdir uses `BROKER_SANDBOX_WORKDIR`. An unknown or missing token
+gets 401, and a build is only visible to the sandbox that made it. `Host` must
+be loopback, `host.openshell.internal`,
 `host.containers.internal`, or listed in `BROKER_ALLOWED_HOSTS`. The context
 must be a subdirectory not reached through a symlink. Symlinks inside it ship
 as links when they resolve inside the context and are dropped otherwise.
@@ -171,12 +175,15 @@ shipped, and results are never written through a symlink under `.buildit`.
 Builder pods get no service account token, no service links, an
 `activeDeadlineSeconds`, and an ownerReference to the serving workload.
 
+`MCP_BIND` (alias `BROKER_BIND`) sets the listen address, `MCP_NAME` the
+server name, and `MCP_TOOLS` a comma-separated subset of the tools to serve.
+
 ```sh
 # in-cluster (namespace from the service account)
-BROKER_TOKEN=... BROKER_SANDBOX_WORKDIR=/sandbox/repo buildit mcp
-# off-cluster dev: a local dir stands in for the sandbox
-BROKER_TOKEN=dev buildit mcp --local-workdir . --kubecontext kind-dev -n default \
-  --bind 127.0.0.1:8849
+MCP_TOKENS_FILE=/run/crucible/buildit.tokens BROKER_SANDBOX_WORKDIR=/sandbox/repo buildit mcp
+# off-cluster dev: a local dir stands in for the sandbox, one fixed token and sandbox
+BROKER_TOKEN=dev buildit mcp --local-workdir . --dev-sandbox me \
+  --kubecontext kind-dev -n default --bind 127.0.0.1:8849
 # end-to-end tests against a disposable cluster
 BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored
 ```

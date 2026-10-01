@@ -77,20 +77,44 @@ impl RelPath {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDir(String);
+
+impl SandboxDir {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let Some(rest) = raw.strip_prefix('/') else {
+            bail!("sandbox workdir {raw:?} must be absolute");
+        };
+        let rest = rest.trim_end_matches('/');
+        let ok = !rest.is_empty()
+            && rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
+            && !raw.chars().any(|c| c.is_whitespace() || c.is_control());
+        if !ok {
+            bail!("invalid sandbox workdir {raw:?}");
+        }
+        Ok(Self(format!("/{rest}")))
+    }
+
+    pub fn join(&self, rel: &RelPath) -> String {
+        format!("{}/{}", self.0, rel.as_str())
+    }
+
+    pub fn results(&self) -> String {
+        format!("{}/{RESULTS_DIR}/", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Workspace {
-    Openshell { workdir: String },
+    Openshell { workdir: SandboxDir },
     Local { dir: PathBuf },
 }
 
 impl Workspace {
-    pub fn needs_sandbox(&self) -> bool {
-        matches!(self, Workspace::Openshell { .. })
-    }
-
     pub fn fetch_context(&self, name: &SandboxName, ctx: &RelPath, dest: &Path) -> Result<()> {
         match self {
             Workspace::Openshell { workdir } => {
-                let path = format!("{}/{}", workdir.trim_end_matches('/'), ctx.as_str());
+                let path = workdir.join(ctx);
                 verified_sync(&mut || sandbox_tree_hash(name, &path), &mut || {
                     download(name, &path, dest)
                 })?;
@@ -164,7 +188,7 @@ fn download_argv(name: &SandboxName, path: &str, dest: &Path) -> Vec<String> {
     ]
 }
 
-fn upload_argv(name: &SandboxName, results: &Path, workdir: &str) -> Vec<String> {
+fn upload_argv(name: &SandboxName, results: &Path, workdir: &SandboxDir) -> Vec<String> {
     vec![
         "openshell".to_string(),
         "sandbox".to_string(),
@@ -172,7 +196,7 @@ fn upload_argv(name: &SandboxName, results: &Path, workdir: &str) -> Vec<String>
         "--no-git-ignore".to_string(),
         name.as_str().to_string(),
         results.to_string_lossy().into_owned(),
-        format!("{}/{RESULTS_DIR}/", workdir.trim_end_matches('/')),
+        workdir.results(),
     ]
 }
 
@@ -497,8 +521,8 @@ mod tests {
     use std::path::Path;
 
     use crate::sandbox::{
-        EXCLUDED, RelPath, SandboxName, Workspace, download_argv, link_stays_inside, sanitize,
-        tree_hash_argv, upload_argv, verified_sync,
+        EXCLUDED, RelPath, SandboxDir, SandboxName, Workspace, download_argv, link_stays_inside,
+        sanitize, tree_hash_argv, upload_argv, verified_sync,
     };
 
     fn local() -> SandboxName {
@@ -591,6 +615,32 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_dirs_are_absolute_and_normal() {
+        let dir = SandboxDir::parse("/sandbox/task-0123abcd/").unwrap();
+        assert_eq!(dir, SandboxDir::parse("/sandbox/task-0123abcd").unwrap());
+        assert_eq!(
+            dir.join(&RelPath::parse("svc/api").unwrap()),
+            "/sandbox/task-0123abcd/svc/api"
+        );
+        assert_eq!(dir.results(), "/sandbox/task-0123abcd/.buildit/");
+        for bad in [
+            "",
+            "/",
+            "//",
+            "sandbox",
+            "./sandbox",
+            "/sandbox//repo",
+            "/sandbox/../etc",
+            "/sandbox/./repo",
+            "/sandbox/re po",
+            "/sandbox/\trepo",
+            "/sandbox/re\u{7f}po",
+        ] {
+            assert!(SandboxDir::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn openshell_argv() {
         let name = SandboxName::parse("ci-1-abc").unwrap();
         assert_eq!(
@@ -605,7 +655,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            upload_argv(&name, Path::new("/tmp/x/buildit-1234"), "/sandbox/repo/"),
+            upload_argv(
+                &name,
+                Path::new("/tmp/x/buildit-1234"),
+                &SandboxDir::parse("/sandbox/repo/").unwrap()
+            ),
             [
                 "openshell",
                 "sandbox",

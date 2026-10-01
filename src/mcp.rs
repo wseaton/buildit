@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use clap::Args;
@@ -17,6 +17,7 @@ use kube::Api;
 use kube::api::{ApiResource, DeleteParams, DynamicObject, ListParams};
 use kube::core::GroupVersion;
 use rmcp::handler::server::common::Extension;
+use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -34,15 +35,14 @@ use crate::buildlog::{
     summarize,
 };
 use crate::pod::{BuilderPod, ExecStatus};
-use crate::sandbox::{RESULTS_DIR, RelPath, SandboxName, Workspace};
+use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace};
 
 pub const MCP_PATH: &str = "/mcp";
-pub const SANDBOX_HEADER: &str = "x-crucible-sandbox";
 
 const SANDBOX_HOSTS: [&str; 2] = ["host.containers.internal", "host.openshell.internal"];
 
-// the caller identity when a local-dir server gets no sandbox header
-const LOCAL_CALLER: &str = "local";
+const DEFAULT_BIND: &str = "0.0.0.0:8849";
+const DEFAULT_NAME: &str = "buildit";
 
 const LABEL_MANAGED_BY: &str = "buildit.dev/managed-by";
 const MANAGED_BY: &str = "mcp";
@@ -65,15 +65,27 @@ const CALL_DRAIN: Duration = Duration::from_secs(20);
 
 #[derive(Args)]
 pub struct McpArgs {
-    /// Listen address for the streamable-http endpoint
-    #[arg(long, env = "BROKER_BIND", default_value = "0.0.0.0:8849")]
-    pub bind: String,
-    /// Sandbox path holding the agent's tree
+    /// Listen address for the streamable-http endpoint [env: MCP_BIND, BROKER_BIND]
+    #[arg(long)]
+    pub bind: Option<String>,
+    /// Token file of `<token> <sandbox> [<workdir>]` lines, re-read on every request
+    #[arg(long, env = "MCP_TOKENS_FILE", conflicts_with = "dev_sandbox")]
+    pub tokens_file: Option<PathBuf>,
+    /// Sandbox path holding the agent's tree, for token lines that name no workdir
     #[arg(long, env = "BROKER_SANDBOX_WORKDIR")]
     pub sandbox_workdir: Option<String>,
     /// Dev: use a local directory in place of the openshell sandbox
     #[arg(long, value_name = "DIR")]
     pub local_workdir: Option<PathBuf>,
+    /// Dev: the sandbox a BROKER_TOKEN caller acts as
+    #[arg(long, value_name = "NAME", requires = "local_workdir")]
+    pub dev_sandbox: Option<String>,
+    /// Server name reported to clients
+    #[arg(long, env = "MCP_NAME", default_value = DEFAULT_NAME)]
+    pub name: String,
+    /// Tools to serve, comma-separated (default: all)
+    #[arg(long, env = "MCP_TOOLS", value_delimiter = ',')]
+    pub tools: Vec<String>,
     /// Dev: run off-cluster against this kubeconfig context
     #[arg(long)]
     pub kubecontext: Option<String>,
@@ -96,22 +108,65 @@ pub struct McpArgs {
     pub limits: Vec<(String, String)>,
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn identity(
+    tokens_file: Option<PathBuf>,
+    dev_sandbox: Option<&str>,
+    dev_token: Option<String>,
+) -> Result<Identity> {
+    if let Some(file) = tokens_file {
+        if dev_token.is_some() {
+            tracing::info!(
+                "ignoring BROKER_TOKEN; callers come from {}",
+                file.display()
+            );
+        }
+        return Ok(Identity::TokenFile(file));
+    }
+    let Some(sandbox) = dev_sandbox else {
+        bail!(
+            "set MCP_TOKENS_FILE (or, for local dev, --local-workdir with --dev-sandbox and \
+             BROKER_TOKEN)"
+        );
+    };
+    let token = dev_token.ok_or_else(|| {
+        anyhow!("--dev-sandbox needs BROKER_TOKEN; refusing to serve unauthenticated")
+    })?;
+    Ok(Identity::Dev {
+        token,
+        sandbox: SandboxName::parse(sandbox)?,
+    })
+}
+
 pub async fn serve(args: McpArgs) -> Result<()> {
-    let token = std::env::var("BROKER_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| anyhow!("BROKER_TOKEN is not set; refusing to serve unauthenticated"))?;
-    let workspace = match (&args.local_workdir, &args.sandbox_workdir) {
-        (Some(dir), _) => Workspace::Local {
+    let identity = identity(
+        args.tokens_file,
+        args.dev_sandbox.as_deref(),
+        env_nonempty("BROKER_TOKEN"),
+    )?;
+    let workspace = match &args.local_workdir {
+        Some(dir) => WorkspaceKind::Local {
             dir: dir
                 .canonicalize()
                 .with_context(|| format!("resolving {}", dir.display()))?,
         },
-        (None, Some(workdir)) => Workspace::Openshell {
-            workdir: workdir.clone(),
+        None => WorkspaceKind::Openshell {
+            default_workdir: args
+                .sandbox_workdir
+                .as_deref()
+                .map(SandboxDir::parse)
+                .transpose()?,
         },
-        (None, None) => bail!("set BROKER_SANDBOX_WORKDIR (or --local-workdir for dev)"),
     };
+    let tools = Tools::select(&args.name, &args.tools)?;
+    let bind = args
+        .bind
+        .or_else(|| env_nonempty("MCP_BIND"))
+        .or_else(|| env_nonempty("BROKER_BIND"))
+        .unwrap_or_else(|| DEFAULT_BIND.to_string());
     let (client, namespace, in_cluster) =
         kube_client(args.kubecontext.as_deref(), args.namespace.as_deref()).await?;
     let owner = if in_cluster {
@@ -122,6 +177,7 @@ pub async fn serve(args: McpArgs) -> Result<()> {
     let broker = Arc::new(Broker {
         client,
         namespace,
+        identity,
         workspace,
         backend: args.backend,
         resources: Resources {
@@ -134,20 +190,21 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         calls: TaskTracker::new(),
     });
 
-    let listener = tokio::net::TcpListener::bind(&args.bind)
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("binding {}", args.bind))?;
+        .with_context(|| format!("binding {bind}"))?;
     tracing::info!(
-        "buildit mcp listening on http://{}{MCP_PATH} (namespace {}, backend {:?})",
-        args.bind,
+        "{} mcp listening on http://{bind}{MCP_PATH} (namespace {}, backend {:?}, tools {})",
+        tools.name,
         broker.namespace,
-        broker.backend
+        broker.backend,
+        tools.names().join(",")
     );
     let hosts = allowed_hosts(env_hosts().as_deref());
     serve_until(
         listener,
         broker,
-        token,
+        tools,
         hosts,
         shutdown_signal()?,
         SHUTDOWN_GRACE,
@@ -158,14 +215,14 @@ pub async fn serve(args: McpArgs) -> Result<()> {
 async fn serve_until(
     listener: tokio::net::TcpListener,
     broker: Arc<Broker>,
-    token: String,
+    tools: Tools,
     hosts: Vec<String>,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
 ) -> Result<()> {
     let ct = CancellationToken::new();
     let calls = broker.calls.clone();
-    let app = router(broker, token, hosts, ct.clone());
+    let app = router(broker, tools, hosts, ct.clone());
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(ct.clone().cancelled_owned())
         .into_future();
@@ -196,7 +253,7 @@ async fn serve_until(
 
 pub fn router(
     broker: Arc<Broker>,
-    token: String,
+    tools: Tools,
     hosts: Vec<String>,
     ct: CancellationToken,
 ) -> axum::Router {
@@ -207,18 +264,16 @@ pub fn router(
         .with_sse_retry(None)
         .with_allowed_hosts(hosts)
         .with_cancellation_token(ct);
+    let served = broker.clone();
     let service: StreamableHttpService<BuilditMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || Ok(BuilditMcp::new(broker.clone())),
+            move || Ok(BuilditMcp::new(served.clone(), tools.clone())),
             Arc::new(NeverSessionManager::default()),
             config,
         );
     axum::Router::new()
         .nest_service(MCP_PATH, service)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(token),
-            require_bearer,
-        ))
+        .layer(axum::middleware::from_fn_with_state(broker, authenticate))
 }
 
 fn shutdown_signal() -> Result<impl Future<Output = ()>> {
@@ -359,26 +414,82 @@ pub fn allowed_hosts(extra: Option<&str>) -> Vec<String> {
     hosts
 }
 
-async fn require_bearer(State(token): State<Arc<String>>, req: Request, next: Next) -> Response {
-    let got = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    if authorized(got, &token) {
-        return next.run(req).await;
+async fn authenticate(State(broker): State<Arc<Broker>>, mut req: Request, next: Next) -> Response {
+    match broker.caller(req.headers()).await {
+        Ok(caller) => {
+            req.extensions_mut().insert(caller);
+            next.run(req).await
+        }
+        Err(Denied::Unauthorized) => (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"missing or unknown bearer token"}"#,
+        )
+            .into_response(),
+        Err(Denied::Unavailable(e)) => {
+            tracing::error!("cannot identify the caller: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"the server cannot identify callers right now"}"#,
+            )
+                .into_response()
+        }
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::CONTENT_TYPE, "application/json")],
-        r#"{"error":"missing or wrong bearer token"}"#,
-    )
-        .into_response()
 }
 
-fn authorized(header: Option<&str>, want: &str) -> bool {
-    header
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|got| constant_time_eq(got.as_bytes(), want.as_bytes()))
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .filter(|t| !t.is_empty())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TokenLine {
+    token: String,
+    sandbox: SandboxName,
+    workdir: Option<SandboxDir>,
+}
+
+// `<token> <sandbox> [<workdir>]` per line; one bad line refuses the whole file
+fn parse_tokens(text: &str) -> Result<Vec<TokenLine>> {
+    let mut lines: Vec<TokenLine> = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let n = index + 1;
+        let mut fields = raw.split_whitespace();
+        let (token, sandbox, workdir) =
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (None, ..) => continue,
+                (Some(token), Some(sandbox), workdir, None) => (token, sandbox, workdir),
+                _ => bail!("token file line {n} is not `<token> <sandbox> [<workdir>]`"),
+            };
+        if lines.iter().any(|l| l.token == token) {
+            bail!("token file line {n} repeats a token");
+        }
+        lines.push(TokenLine {
+            token: token.to_string(),
+            sandbox: SandboxName::parse(sandbox).with_context(|| format!("token file line {n}"))?,
+            workdir: workdir
+                .map(SandboxDir::parse)
+                .transpose()
+                .with_context(|| format!("token file line {n}"))?,
+        });
+    }
+    Ok(lines)
+}
+
+// compares every line in constant time, so timing leaks neither which line matched nor a prefix
+fn match_token<'a>(lines: &'a [TokenLine], token: &str) -> Option<&'a TokenLine> {
+    let mut found = None;
+    for line in lines {
+        if constant_time_eq(line.token.as_bytes(), token.as_bytes()) {
+            found = Some(line);
+        }
+    }
+    found
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -526,10 +637,33 @@ impl LiveBuild {
     }
 }
 
+pub enum Identity {
+    TokenFile(PathBuf),
+    Dev { token: String, sandbox: SandboxName },
+}
+
+pub enum WorkspaceKind {
+    Openshell { default_workdir: Option<SandboxDir> },
+    Local { dir: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    pub sandbox: SandboxName,
+    pub workspace: Workspace,
+}
+
+#[derive(Debug)]
+pub enum Denied {
+    Unauthorized,
+    Unavailable(anyhow::Error),
+}
+
 pub struct Broker {
     client: kube::Client,
     namespace: String,
-    workspace: Workspace,
+    identity: Identity,
+    workspace: WorkspaceKind,
     backend: Backend,
     resources: Resources,
     deadline_secs: i64,
@@ -816,17 +950,43 @@ impl StepOutcome {
 }
 
 impl Broker {
-    fn caller(&self, parts: &Parts) -> Result<SandboxName> {
-        let raw = parts
-            .headers
-            .get(SANDBOX_HEADER)
-            .map(|v| v.to_str().context("sandbox header is not ascii"))
-            .transpose()?;
-        match (raw, self.workspace.needs_sandbox()) {
-            (Some(raw), _) => SandboxName::parse(raw),
-            (None, true) => bail!("request carries no {SANDBOX_HEADER} header; refusing"),
-            (None, false) => SandboxName::parse(LOCAL_CALLER),
-        }
+    pub async fn caller(&self, headers: &HeaderMap) -> Result<Caller, Denied> {
+        let token = bearer(headers).ok_or(Denied::Unauthorized)?;
+        let (sandbox, workdir) = match &self.identity {
+            Identity::Dev {
+                token: want,
+                sandbox,
+            } => {
+                if !constant_time_eq(token.as_bytes(), want.as_bytes()) {
+                    return Err(Denied::Unauthorized);
+                }
+                (sandbox.clone(), None)
+            }
+            Identity::TokenFile(path) => {
+                let text = tokio::fs::read_to_string(path)
+                    .await
+                    .with_context(|| format!("reading {}", path.display()))
+                    .map_err(Denied::Unavailable)?;
+                let lines = parse_tokens(&text)
+                    .with_context(|| path.display().to_string())
+                    .map_err(Denied::Unavailable)?;
+                let line = match_token(&lines, token).ok_or(Denied::Unauthorized)?;
+                (line.sandbox.clone(), line.workdir.clone())
+            }
+        };
+        let workspace = match &self.workspace {
+            WorkspaceKind::Local { dir } => Workspace::Local { dir: dir.clone() },
+            WorkspaceKind::Openshell { default_workdir } => Workspace::Openshell {
+                workdir: workdir.or_else(|| default_workdir.clone()).ok_or_else(|| {
+                    Denied::Unavailable(anyhow!(
+                        "sandbox {} has no workdir in the token file and \
+                             BROKER_SANDBOX_WORKDIR is unset",
+                        sandbox.as_str()
+                    ))
+                })?,
+            },
+        };
+        Ok(Caller { sandbox, workspace })
     }
 
     fn pods(&self) -> Api<Pod> {
@@ -930,9 +1090,8 @@ impl Broker {
         })
     }
 
-    async fn publish(&self, caller: &SandboxName, results: &Path) -> Result<()> {
-        let ws = &self.workspace;
-        tokio::task::block_in_place(|| ws.publish(caller, results))
+    async fn publish(&self, caller: &Caller, results: &Path) -> Result<()> {
+        tokio::task::block_in_place(|| caller.workspace.publish(&caller.sandbox, results))
     }
 
     async fn note(&self, pod: &BuilderPod, backend: Backend, log: LogName, line: &str) {
@@ -974,31 +1133,34 @@ impl Broker {
 
     pub async fn build(
         &self,
-        caller: &SandboxName,
+        caller: &Caller,
         params: BuildParams,
         ct: &CancellationToken,
     ) -> Result<BuildReply> {
         let req = BuildRequest::parse(params)?;
         self.sweep_ended().await;
-        self.check_cap(caller, None).await?;
+        self.check_cap(&caller.sandbox, None).await?;
         let id = BuildId::fresh();
         let stage = tempfile::tempdir().context("creating staging dir")?;
         let ctx_dir = stage.path().join("ctx");
         let results = stage.path().join(id.as_str());
         std::fs::create_dir_all(&results).context("creating results dir")?;
 
-        let ws = &self.workspace;
-        tokio::task::block_in_place(|| ws.fetch_context(caller, &req.context, &ctx_dir))?;
+        tokio::task::block_in_place(|| {
+            caller
+                .workspace
+                .fetch_context(&caller.sandbox, &req.context, &ctx_dir)
+        })?;
         let tarball = crate::context::tarball(&ctx_dir)?;
         tracing::info!(
             "build {id}: sandbox {} context {} ({} KiB)",
-            caller.as_str(),
+            caller.sandbox.as_str(),
             req.context.as_str(),
             tarball.len() / 1024
         );
 
         let meta = PodMeta {
-            labels: pod_labels(caller, &id),
+            labels: pod_labels(&caller.sandbox, &id),
             annotations: req.annotations(),
             log_dir: Some(LOG_DIR.to_string()),
         };
@@ -1034,14 +1196,14 @@ impl Broker {
 
     async fn finish_build(
         &self,
-        caller: &SandboxName,
+        caller: &Caller,
         pod: &BuilderPod,
         id: &BuildId,
         req: &BuildRequest,
         tarball: &[u8],
         results: &Path,
     ) -> Result<BuildReply> {
-        self.check_cap(caller, Some(id)).await?;
+        self.check_cap(&caller.sandbox, Some(id)).await?;
         pod.wait_ready(POD_READY_TIMEOUT).await?;
 
         let started = Instant::now();
@@ -1117,7 +1279,7 @@ impl Broker {
         last.ok_or_else(|| anyhow!("backend produced no build steps"))
     }
 
-    pub async fn run(&self, caller: &SandboxName, params: RunParams) -> Result<RunReply> {
+    pub async fn run(&self, caller: &Caller, params: RunParams) -> Result<RunReply> {
         if params.cmd.is_empty() {
             bail!("cmd must not be empty");
         }
@@ -1127,7 +1289,7 @@ impl Broker {
             .iter()
             .map(|p| RelPath::parse_container(p))
             .collect::<Result<Vec<_>>>()?;
-        let build = self.find(caller, &id).await?;
+        let build = self.find(&caller.sandbox, &id).await?;
         if !build.runnable() {
             bail!(
                 "build {id} is not runnable (state {}); see logs(which: \"build\")",
@@ -1270,8 +1432,60 @@ impl Broker {
 }
 
 #[derive(Clone)]
+pub struct Tools {
+    name: Arc<str>,
+    router: Arc<ToolRouter<BuilditMcp>>,
+}
+
+impl Tools {
+    // an empty selection serves every tool
+    pub fn select(name: &str, wanted: &[String]) -> Result<Self> {
+        let mut router = BuilditMcp::tool_router();
+        let wanted: Vec<&str> = wanted
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if let Some(unknown) = wanted.iter().find(|t| !router.has_route(t)) {
+            bail!("unknown tool {unknown:?} in MCP_TOOLS");
+        }
+        if !wanted.is_empty() {
+            for tool in router.list_all() {
+                if !wanted.contains(&tool.name.as_ref()) {
+                    router.remove_route(&tool.name);
+                }
+            }
+        }
+        Ok(Self {
+            name: name.into(),
+            router: Arc::new(router),
+        })
+    }
+
+    fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+#[derive(Clone)]
 pub struct BuilditMcp {
     broker: Arc<Broker>,
+    tools: Tools,
+}
+
+fn authenticated(parts: &Parts) -> Result<Caller> {
+    parts
+        .extensions
+        .get::<Caller>()
+        .cloned()
+        .ok_or_else(|| anyhow!("request reached a tool without an authenticated caller"))
 }
 
 async fn cancellable<T>(
@@ -1293,8 +1507,8 @@ fn reply<T: Serialize>(result: Result<T>) -> Result<String, String> {
 
 #[tool_router]
 impl BuilditMcp {
-    pub fn new(broker: Arc<Broker>) -> Self {
-        Self { broker }
+    pub fn new(broker: Arc<Broker>, tools: Tools) -> Self {
+        Self { broker, tools }
     }
 
     #[tool(
@@ -1313,7 +1527,7 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             async {
-                let caller = broker.caller(&parts)?;
+                let caller = authenticated(&parts)?;
                 broker.build(&caller, params, &ct).await
             }
             .await,
@@ -1335,7 +1549,7 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             cancellable(&ct, async {
-                let caller = broker.caller(&parts)?;
+                let caller = authenticated(&parts)?;
                 broker.run(&caller, params).await
             })
             .await,
@@ -1359,8 +1573,8 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             cancellable(&ct, async {
-                let caller = broker.caller(&parts)?;
-                broker.logs(&caller, params).await
+                let caller = authenticated(&parts)?;
+                broker.logs(&caller.sandbox, params).await
             })
             .await,
         )
@@ -1377,8 +1591,10 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             cancellable(&ct, async {
-                let caller = broker.caller(&parts)?;
-                let deleted = broker.clean(&caller, params.build_id.as_deref()).await?;
+                let caller = authenticated(&parts)?;
+                let deleted = broker
+                    .clean(&caller.sandbox, params.build_id.as_deref())
+                    .await?;
                 Ok(CleanReply { deleted })
             })
             .await,
@@ -1386,18 +1602,19 @@ impl BuilditMcp {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tools.router)]
 impl ServerHandler for BuilditMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("buildit", env!("CARGO_PKG_VERSION")))
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new(self.tools.name.as_ref(), env!("CARGO_PKG_VERSION")),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1411,14 +1628,56 @@ mod tests {
 
     use crate::backend::{Backend, Resources};
     use crate::mcp::{
-        Broker, BuildId, BuildParams, BuildRequest, LABEL_BUILD_ID, MCP_PATH, SANDBOX_HEADER,
-        alive, allowed_hosts, authorized, constant_time_eq, fetch_argv, from_argv, kube_client,
-        owned_by, rm_argv, router, run_argv, selector, serve_until, step_outcome, unpack_fetched,
-        within_cap, workload_owner,
+        Broker, BuildId, BuildParams, BuildRequest, Caller, Denied, Identity, LABEL_BUILD_ID,
+        MCP_PATH, McpArgs, TokenLine, Tools, WorkspaceKind, alive, allowed_hosts, bearer,
+        constant_time_eq, fetch_argv, from_argv, identity, kube_client, match_token, owned_by,
+        parse_tokens, rm_argv, router, run_argv, selector, serve_until, step_outcome,
+        unpack_fetched, within_cap, workload_owner,
     };
-    use crate::sandbox::{RelPath, SandboxName, Workspace};
+    use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
 
-    const TOKEN: &str = "s3cr3t-token";
+    const SANDBOXES: [&str; 7] = [
+        "ci-1-abc", "sb-a", "sb-b", "sb-down", "sb-gone", "sb-new", "sb-old",
+    ];
+
+    fn token_for(sandbox: &str) -> String {
+        format!("tok-{sandbox}")
+    }
+
+    struct Tokens {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl Tokens {
+        fn with(body: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens");
+            let tokens = Self { dir, path };
+            tokens.write(body);
+            tokens
+        }
+
+        fn all() -> Self {
+            Self::with(
+                &SANDBOXES
+                    .iter()
+                    .map(|s| format!("{} {s}\n", token_for(s)))
+                    .collect::<String>(),
+            )
+        }
+
+        // replaced by rename, the way crucible writes it
+        fn write(&self, body: &str) {
+            let tmp = self.dir.path().join("tokens.tmp");
+            std::fs::write(&tmp, body).unwrap();
+            std::fs::rename(&tmp, &self.path).unwrap();
+        }
+
+        fn identity(&self) -> Identity {
+            Identity::TokenFile(self.path.clone())
+        }
+    }
 
     fn params(context: &str) -> BuildParams {
         BuildParams {
@@ -1430,17 +1689,75 @@ mod tests {
         }
     }
 
+    fn headers(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            map.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        map
+    }
+
     #[test]
-    fn bearer_must_match_exactly() {
-        assert!(authorized(Some("Bearer s3cr3t"), "s3cr3t"));
-        assert!(!authorized(None, "s3cr3t"));
-        assert!(!authorized(Some("s3cr3t"), "s3cr3t"));
-        assert!(!authorized(Some("Bearer wrong"), "s3cr3t"));
-        assert!(!authorized(Some("Bearer s3cr3t2"), "s3cr3t"));
-        assert!(!authorized(Some("Bearer "), "s3cr3t"));
-        assert!(!authorized(Some("bearer s3cr3t"), "s3cr3t"));
+    fn bearer_takes_only_the_bearer_scheme() {
+        let got = |v: &str| bearer(&headers(&[("authorization", v)])).map(str::to_string);
+        assert_eq!(got("Bearer s3cr3t").as_deref(), Some("s3cr3t"));
+        assert_eq!(got("s3cr3t"), None);
+        assert_eq!(got("Bearer "), None);
+        assert_eq!(got("bearer s3cr3t"), None);
+        assert_eq!(got("Basic czNjcjN0"), None);
+        assert_eq!(bearer(&headers(&[])), None);
+        assert_eq!(bearer(&headers(&[("x-crucible-sandbox", "sb-a")])), None);
         assert!(constant_time_eq(b"", b""));
         assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn token_lines_take_an_optional_workdir() {
+        let lines =
+            parse_tokens("\n  tok-a sb-a /sandbox/task-0123abcd\n\ttok-b   sb-b  \n\n").unwrap();
+        assert_eq!(
+            lines,
+            [
+                TokenLine {
+                    token: "tok-a".to_string(),
+                    sandbox: SandboxName::parse("sb-a").unwrap(),
+                    workdir: Some(SandboxDir::parse("/sandbox/task-0123abcd").unwrap()),
+                },
+                TokenLine {
+                    token: "tok-b".to_string(),
+                    sandbox: SandboxName::parse("sb-b").unwrap(),
+                    workdir: None,
+                },
+            ]
+        );
+        assert_eq!(parse_tokens("").unwrap(), []);
+        for (body, want) in [
+            ("tok-a\n", "line 1 is not"),
+            ("tok-a sb-a /sandbox x\n", "line 1 is not"),
+            ("tok-a sb-a\ntok-a sb-b\n", "line 2 repeats a token"),
+            ("tok-a --gateway=x\n", "invalid sandbox name"),
+            ("tok-a sb-a\ntok-b sb-b sandbox/rel\n", "must be absolute"),
+            ("tok-a sb-a /sandbox/../etc\n", "invalid sandbox workdir"),
+        ] {
+            let err = format!("{:#}", parse_tokens(body).unwrap_err());
+            assert!(err.contains(want), "{body:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_token_matches_only_its_own_line() {
+        let lines = parse_tokens("tok-a sb-a\ntok-b sb-b\n").unwrap();
+        let sandbox = |t: &str| match_token(&lines, t).map(|l| l.sandbox.as_str().to_string());
+        assert_eq!(sandbox("tok-a").as_deref(), Some("sb-a"));
+        assert_eq!(sandbox("tok-b").as_deref(), Some("sb-b"));
+        assert_eq!(sandbox("tok-"), None, "a prefix is not a match");
+        assert_eq!(sandbox("tok-ab"), None);
+        assert_eq!(sandbox("sb-a"), None, "a sandbox name is not a token");
+        assert_eq!(sandbox(""), None);
     }
 
     #[test]
@@ -1730,12 +2047,13 @@ mod tests {
         );
     }
 
-    fn broker(workspace: Workspace) -> Arc<Broker> {
+    fn broker(identity: Identity, workspace: WorkspaceKind) -> Arc<Broker> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
         Arc::new(Broker {
             client: kube::Client::try_from(config).unwrap(),
             namespace: "builds".to_string(),
+            identity,
             workspace,
             backend: Backend::Buildah,
             resources: Resources::default(),
@@ -1746,41 +2064,287 @@ mod tests {
         })
     }
 
-    fn parts(sandbox: Option<&str>) -> axum::http::request::Parts {
-        let mut req = axum::http::Request::builder();
-        if let Some(s) = sandbox {
-            req = req.header(SANDBOX_HEADER, s);
+    fn local(dir: &Path) -> WorkspaceKind {
+        WorkspaceKind::Local {
+            dir: dir.to_path_buf(),
         }
-        req.body(()).unwrap().into_parts().0
+    }
+
+    fn openshell(default_workdir: Option<&str>) -> WorkspaceKind {
+        WorkspaceKind::Openshell {
+            default_workdir: default_workdir.map(|d| SandboxDir::parse(d).unwrap()),
+        }
+    }
+
+    fn openshell_caller(sandbox: &str, workdir: &str) -> Caller {
+        Caller {
+            sandbox: SandboxName::parse(sandbox).unwrap(),
+            workspace: Workspace::Openshell {
+                workdir: SandboxDir::parse(workdir).unwrap(),
+            },
+        }
+    }
+
+    async fn caller_as(broker: &Broker, pairs: &[(&str, &str)]) -> Result<Caller, String> {
+        broker.caller(&headers(pairs)).await.map_err(|e| match e {
+            Denied::Unauthorized => "unauthorized".to_string(),
+            Denied::Unavailable(e) => format!("unavailable: {e:#}"),
+        })
     }
 
     #[tokio::test]
-    async fn caller_identity_comes_from_one_place() {
-        let local = broker(Workspace::Local {
-            dir: std::env::temp_dir(),
-        });
-        assert_eq!(local.caller(&parts(None)).unwrap().as_str(), "local");
-        assert_eq!(local.caller(&parts(Some("sb-a"))).unwrap().as_str(), "sb-a");
-        assert!(local.caller(&parts(Some("--x"))).is_err());
-        let shell = broker(Workspace::Openshell {
-            workdir: "/sandbox".to_string(),
-        });
-        let err = shell.caller(&parts(None)).unwrap_err().to_string();
-        assert!(err.contains(SANDBOX_HEADER), "{err}");
-        assert_eq!(shell.caller(&parts(Some("sb-a"))).unwrap().as_str(), "sb-a");
+    async fn token_a_cannot_act_as_sandbox_b() {
+        let tokens = Tokens::with("tok-a sb-a /sandbox/task-aaaa\ntok-b sb-b /sandbox/task-bbbb\n");
+        let broker = broker(tokens.identity(), openshell(None));
+        let a = openshell_caller("sb-a", "/sandbox/task-aaaa");
+        assert_eq!(
+            caller_as(&broker, &[("authorization", "Bearer tok-a")]).await,
+            Ok(a.clone())
+        );
+        assert_eq!(
+            caller_as(
+                &broker,
+                &[
+                    ("authorization", "Bearer tok-a"),
+                    ("x-crucible-sandbox", "sb-b"),
+                ]
+            )
+            .await,
+            Ok(a),
+            "a sandbox header does not override the token"
+        );
+        for pairs in [
+            &[("x-crucible-sandbox", "sb-b")][..],
+            &[("authorization", "Bearer sb-b")],
+            &[("authorization", "Bearer tok-")],
+            &[("authorization", "Bearer tok-a tok-b")],
+            &[("authorization", "tok-a")],
+            &[],
+        ] {
+            assert_eq!(
+                caller_as(&broker, pairs).await,
+                Err("unauthorized".to_string()),
+                "{pairs:?}"
+            );
+        }
     }
 
-    async fn serve(workspace: Workspace) -> String {
-        let app = router(
-            broker(workspace),
-            TOKEN.to_string(),
-            allowed_hosts(None),
-            CancellationToken::new(),
+    #[tokio::test]
+    async fn a_token_file_rewrite_takes_effect_on_the_next_request() {
+        let tokens = Tokens::with("tok-a sb-a /sandbox/one\n");
+        let broker = broker(tokens.identity(), openshell(None));
+        let a = [("authorization", "Bearer tok-a")];
+        let c = [("authorization", "Bearer tok-c")];
+        assert_eq!(
+            caller_as(&broker, &a).await,
+            Ok(openshell_caller("sb-a", "/sandbox/one"))
         );
+        assert_eq!(
+            caller_as(&broker, &c).await,
+            Err("unauthorized".to_string())
+        );
+
+        tokens.write("tok-a sb-a /sandbox/two\ntok-c sb-c /sandbox/three\n");
+        assert_eq!(
+            caller_as(&broker, &a).await,
+            Ok(openshell_caller("sb-a", "/sandbox/two"))
+        );
+        assert_eq!(
+            caller_as(&broker, &c).await,
+            Ok(openshell_caller("sb-c", "/sandbox/three"))
+        );
+
+        tokens.write("tok-c sb-c /sandbox/three\n");
+        assert_eq!(
+            caller_as(&broker, &a).await,
+            Err("unauthorized".to_string())
+        );
+
+        tokens.write("tok-c sb-c /sandbox/three\ntok-c sb-d /sandbox/four\n");
+        let err = caller_as(&broker, &c).await.unwrap_err();
+        assert!(err.contains("repeats a token"), "{err}");
+
+        std::fs::remove_file(&tokens.path).unwrap();
+        let err = caller_as(&broker, &c).await.unwrap_err();
+        assert!(err.starts_with("unavailable: reading"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_two_field_line_uses_the_default_workdir() {
+        let tokens = Tokens::with("tok-a sb-a\ntok-b sb-b /sandbox/task-bbbb\n");
+        let a = [("authorization", "Bearer tok-a")];
+        let b = [("authorization", "Bearer tok-b")];
+        let with_default = broker(tokens.identity(), openshell(Some("/sandbox/repo/")));
+        assert_eq!(
+            caller_as(&with_default, &a).await,
+            Ok(openshell_caller("sb-a", "/sandbox/repo"))
+        );
+        assert_eq!(
+            caller_as(&with_default, &b).await,
+            Ok(openshell_caller("sb-b", "/sandbox/task-bbbb")),
+            "a line's own workdir beats the default"
+        );
+        let without = broker(tokens.identity(), openshell(None));
+        let err = caller_as(&without, &a).await.unwrap_err();
+        assert!(
+            err.contains("sb-a has no workdir") && err.contains("BROKER_SANDBOX_WORKDIR"),
+            "{err}"
+        );
+        assert_eq!(
+            caller_as(&without, &b).await,
+            Ok(openshell_caller("sb-b", "/sandbox/task-bbbb"))
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_paths_follow_the_callers_workdir() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let tokens = Tokens::with(&format!(
+            "tok-a sb-a /sandbox/task-{sha}\ntok-b sb-b /sandbox/task-ffff\n"
+        ));
+        let broker = broker(tokens.identity(), openshell(Some("/sandbox/repo")));
+        let caller = caller_as(&broker, &[("authorization", "Bearer tok-a")])
+            .await
+            .unwrap();
+        let Workspace::Openshell { workdir } = &caller.workspace else {
+            panic!("{caller:?}");
+        };
+        let ctx = RelPath::parse("svc/api").unwrap();
+        assert_eq!(workdir.join(&ctx), format!("/sandbox/task-{sha}/svc/api"));
+        assert_eq!(workdir.results(), format!("/sandbox/task-{sha}/.buildit/"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker {
+            workspace: local(dir.path()),
+            ..Arc::into_inner(broker).unwrap()
+        };
+        assert_eq!(
+            caller_as(&broker, &[("authorization", "Bearer tok-b")]).await,
+            Ok(Caller {
+                sandbox: SandboxName::parse("sb-b").unwrap(),
+                workspace: Workspace::Local {
+                    dir: dir.path().to_path_buf()
+                },
+            }),
+            "a local workspace ignores the line's workdir"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dev_token_names_one_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(
+            Identity::Dev {
+                token: "dev-token".to_string(),
+                sandbox: SandboxName::parse("me").unwrap(),
+            },
+            local(dir.path()),
+        );
+        let me = Caller {
+            sandbox: SandboxName::parse("me").unwrap(),
+            workspace: Workspace::Local {
+                dir: dir.path().to_path_buf(),
+            },
+        };
+        assert_eq!(
+            caller_as(
+                &broker,
+                &[
+                    ("authorization", "Bearer dev-token"),
+                    ("x-crucible-sandbox", "sb-b")
+                ]
+            )
+            .await,
+            Ok(me)
+        );
+        for token in ["Bearer dev-toke", "Bearer dev-token2", "dev-token"] {
+            assert_eq!(
+                caller_as(&broker, &[("authorization", token)]).await,
+                Err("unauthorized".to_string()),
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn broker_token_is_only_a_dev_identity() {
+        let file = PathBuf::from("/run/tokens");
+        assert!(matches!(
+            identity(Some(file.clone()), None, Some("dev".to_string())),
+            Ok(Identity::TokenFile(p)) if p == file
+        ));
+        let err = identity(None, None, Some("dev".to_string()))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("MCP_TOKENS_FILE"), "{err}");
+        let err = identity(None, Some("me"), None).err().unwrap().to_string();
+        assert!(err.contains("BROKER_TOKEN"), "{err}");
+        assert!(identity(None, Some("--x"), Some("dev".to_string())).is_err());
+        assert!(matches!(
+            identity(None, Some("me"), Some("dev".to_string())),
+            Ok(Identity::Dev { token, sandbox }) if token == "dev" && sandbox.as_str() == "me"
+        ));
+    }
+
+    #[derive(clap::Parser)]
+    struct McpCli {
+        #[command(flatten)]
+        args: McpArgs,
+    }
+
+    #[test]
+    fn dev_flags_need_the_local_workdir_and_exclude_the_token_file() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            McpCli::try_parse_from(std::iter::once("mcp").chain(argv.iter().copied()))
+        };
+        assert!(parse(&["--dev-sandbox", "me"]).is_err());
+        assert!(
+            parse(&[
+                "--dev-sandbox",
+                "me",
+                "--local-workdir",
+                ".",
+                "--tokens-file",
+                "/run/tokens"
+            ])
+            .is_err()
+        );
+        let ok = parse(&["--dev-sandbox", "me", "--local-workdir", "."]).unwrap();
+        assert_eq!(ok.args.dev_sandbox.as_deref(), Some("me"));
+        let ok = parse(&["--tokens-file", "/run/tokens", "--tools", "build,logs"]).unwrap();
+        assert_eq!(ok.args.tools, ["build", "logs"]);
+        assert_eq!(ok.args.name, "buildit");
+    }
+
+    #[test]
+    fn mcp_tools_selects_the_served_tools() {
+        let all = ["build", "clean", "logs", "run"];
+        assert_eq!(Tools::select("buildit", &[]).unwrap().names(), all);
+        assert_eq!(
+            Tools::select("buildit", &[String::new()]).unwrap().names(),
+            all
+        );
+        let some = Tools::select("buildit", &["logs".to_string(), " build ".to_string()]).unwrap();
+        assert_eq!(some.names(), ["build", "logs"]);
+        let err = Tools::select("buildit", &["build".to_string(), "deploy".to_string()])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("\"deploy\""), "{err}");
+    }
+
+    async fn serve_with(broker: Arc<Broker>, tools: Tools) -> String {
+        let app = router(broker, tools, allowed_hosts(None), CancellationToken::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         addr.to_string()
+    }
+
+    async fn serve(broker: Arc<Broker>) -> String {
+        serve_with(broker, Tools::select("buildit", &[]).unwrap()).await
     }
 
     struct Reply {
@@ -1822,11 +2386,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn http_rejects_missing_or_wrong_token_and_foreign_hosts() {
-        let addr = serve(Workspace::Local {
-            dir: std::env::temp_dir(),
-        })
-        .await;
-        let bearer = format!("Bearer {TOKEN}");
+        let tokens = Tokens::all();
+        let addr = serve(broker(tokens.identity(), local(&std::env::temp_dir()))).await;
+        let bearer = format!("Bearer {}", token_for("sb-a"));
         let status = |host: &'static str, auth: Option<String>| {
             let addr = addr.clone();
             async move {
@@ -1837,7 +2399,7 @@ mod tests {
         };
         assert_eq!(status("127.0.0.1", None).await, 401);
         assert_eq!(status("127.0.0.1", Some("Bearer nope".into())).await, 401);
-        assert_eq!(status("127.0.0.1", Some(TOKEN.into())).await, 401);
+        assert_eq!(status("127.0.0.1", Some(token_for("sb-a"))).await, 401);
         assert_eq!(status("evil.example", Some(bearer.clone())).await, 403);
         assert_eq!(
             status("host.openshell.internal:8849", Some(bearer.clone())).await,
@@ -1871,39 +2433,47 @@ mod tests {
         name: &str,
         args: serde_json::Value,
     ) -> (bool, String) {
+        let reply = raw_call_with(
+            addr,
+            &format!("Bearer {}", token_for(sandbox)),
+            "",
+            name,
+            args,
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        tool_text(&reply)
+    }
+
+    async fn raw_call_with(
+        addr: &str,
+        auth: &str,
+        extra: &str,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Reply {
         let body = jsonrpc(
             7,
             "tools/call",
             serde_json::json!({ "name": name, "arguments": args }),
         );
-        let reply = exchange(
-            addr,
-            http(
-                "POST",
-                "127.0.0.1",
-                Some(&format!("Bearer {TOKEN}")),
-                &format!("{SANDBOX_HEADER}: {sandbox}\r\n"),
-                &body,
-            ),
-        )
-        .await;
-        assert_eq!(reply.status, 200, "{}", reply.body);
-        assert!(!reply.head.contains("mcp-session-id"), "{}", reply.head);
-        assert!(
-            reply.head.contains("content-type: application/json"),
-            "{}",
-            reply.head
-        );
-        tool_text(&reply)
+        let reply = exchange(addr, http("POST", "127.0.0.1", Some(auth), extra, &body)).await;
+        if reply.status == 200 {
+            assert!(!reply.head.contains("mcp-session-id"), "{}", reply.head);
+            assert!(
+                reply.head.contains("content-type: application/json"),
+                "{}",
+                reply.head
+            );
+        }
+        reply
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn stateless_posts_need_no_session_and_get_json() {
-        let addr = serve(Workspace::Local {
-            dir: std::env::temp_dir(),
-        })
-        .await;
-        let bearer = format!("Bearer {TOKEN}");
+        let tokens = Tokens::all();
+        let addr = serve(broker(tokens.identity(), local(&std::env::temp_dir()))).await;
+        let bearer = format!("Bearer {}", token_for("sb-a"));
 
         let init = exchange(&addr, http("POST", "127.0.0.1", Some(&bearer), "", INIT)).await;
         assert_eq!(init.status, 200);
@@ -1962,19 +2532,13 @@ mod tests {
     async fn client(
         addr: &str,
         token: &str,
-        sandbox: Option<&str>,
     ) -> Result<
         rmcp::service::RunningService<rmcp::RoleClient, ()>,
         Box<rmcp::service::ClientInitializeError>,
     > {
-        let mut headers = HashMap::new();
-        if let Some(name) = sandbox {
-            headers.insert(SANDBOX_HEADER.parse().unwrap(), name.parse().unwrap());
-        }
         let config =
             StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}{MCP_PATH}"))
-                .auth_header(token)
-                .custom_headers(headers);
+                .auth_header(token);
         ().serve(StreamableHttpClientTransport::from_config(config))
             .await
             .map_err(Box::new)
@@ -2012,17 +2576,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn mcp_round_trip_lists_tools_and_reports_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let addr = serve(Workspace::Local {
-            dir: dir.path().to_path_buf(),
-        })
-        .await;
+        let tokens = Tokens::all();
+        let addr = serve(broker(tokens.identity(), local(dir.path()))).await;
 
         assert!(
-            client(&addr, "wrong", None).await.is_err(),
+            client(&addr, "wrong").await.is_err(),
             "initialize must fail without the right token"
         );
 
-        let c = client(&addr, TOKEN, Some("ci-1-abc")).await.unwrap();
+        let c = client(&addr, &token_for("ci-1-abc")).await.unwrap();
         let tools = c.list_all_tools().await.unwrap();
         let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
         names.sort();
@@ -2103,20 +2665,81 @@ mod tests {
         c.cancel().await.unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn openshell_mode_refuses_requests_without_a_sandbox_header() {
-        let addr = serve(Workspace::Openshell {
-            workdir: "/sandbox/repo".to_string(),
-        })
-        .await;
-        let c = client(&addr, TOKEN, None).await.unwrap();
-        let e = call_err(&c, "build", serde_json::json!({ "context": "svc" })).await;
-        assert!(e.contains(SANDBOX_HEADER), "{e}");
-        c.cancel().await.unwrap();
+    fn sandbox_of(text: &str) -> &str {
+        let at = text
+            .find("buildit.dev/sandbox=")
+            .unwrap_or_else(|| panic!("no sandbox selector in {text}"));
+        let rest = &text[at + "buildit.dev/sandbox=".len()..];
+        &rest[..rest.find(')').unwrap_or(rest.len())]
+    }
 
-        let c = client(&addr, TOKEN, Some("--gateway=evil")).await.unwrap();
-        let e = call_err(&c, "clean", serde_json::json!({})).await;
-        assert!(e.contains("invalid sandbox name"), "{e}");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_callers_come_from_the_token_file_not_headers() {
+        let tokens = Tokens::with("tok-a sb-a /sandbox/task-aaaa\ntok-b sb-b /sandbox/task-bbbb\n");
+        let addr = serve(broker(tokens.identity(), openshell(None))).await;
+        let clean = |auth: &'static str, extra: &'static str| {
+            let addr = addr.clone();
+            async move { raw_call_with(&addr, auth, extra, "clean", serde_json::json!({})).await }
+        };
+
+        // the kube API is unreachable, so clean fails naming the selector it listed with
+        let reply = clean("Bearer tok-a", "X-Crucible-Sandbox: sb-b\r\n").await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let (is_error, text) = tool_text(&reply);
+        assert!(is_error, "{text}");
+        assert_eq!(sandbox_of(&text), "sb-a", "{text}");
+        let (_, text) = tool_text(&clean("Bearer tok-b", "").await);
+        assert_eq!(sandbox_of(&text), "sb-b", "{text}");
+
+        for (auth, extra) in [
+            ("", "X-Crucible-Sandbox: sb-a\r\n"),
+            ("Bearer nope", "X-Crucible-Sandbox: sb-a\r\n"),
+            ("Bearer sb-a", ""),
+        ] {
+            let reply = clean(auth, extra).await;
+            assert_eq!(reply.status, 401, "{auth:?} {extra:?}: {}", reply.body);
+        }
+        let probe = exchange(&addr, http("POST", "127.0.0.1", None, "", INIT)).await;
+        assert_eq!(probe.status, 401, "crucible's unauthenticated probe");
+
+        tokens.write("tok-c sb-c /sandbox/task-cccc\n");
+        assert_eq!(clean("Bearer tok-a", "").await.status, 401);
+        let (_, text) = tool_text(&clean("Bearer tok-c", "").await);
+        assert_eq!(sandbox_of(&text), "sb-c", "{text}");
+
+        tokens.write("tok-c\n");
+        let reply = clean("Bearer tok-c", "").await;
+        assert_eq!(reply.status, 500, "{}", reply.body);
+        assert!(!reply.body.contains("tok-c"), "{}", reply.body);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_tools_and_name_shape_what_clients_see() {
+        let tokens = Tokens::all();
+        let tools = Tools::select("builds", &["logs".to_string(), "clean".to_string()]).unwrap();
+        let addr = serve_with(
+            broker(tokens.identity(), openshell(Some("/sandbox/repo"))),
+            tools,
+        )
+        .await;
+        let c = client(&addr, &token_for("sb-a")).await.unwrap();
+        let info = c.peer_info().unwrap();
+        assert_eq!(info.server_info.as_ref().unwrap().name, "builds");
+        let mut names: Vec<_> = c
+            .list_all_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["clean", "logs"]);
+        assert!(
+            c.call_tool(call("build", serde_json::json!({ "context": "svc" })))
+                .await
+                .is_err(),
+            "an unselected tool is not callable"
+        );
         c.cancel().await.unwrap();
     }
 
@@ -2134,7 +2757,7 @@ mod tests {
         let task = tokio::spawn(serve_until(
             listener,
             broker,
-            TOKEN.to_string(),
+            Tools::select("buildit", &[]).unwrap(),
             allowed_hosts(None),
             async move {
                 let _ = stopped.await;
@@ -2157,10 +2780,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_does_not_wait_on_idle_connections() {
+        let tokens = Tokens::all();
         let server = start(
-            broker(Workspace::Local {
-                dir: std::env::temp_dir(),
-            }),
+            broker(tokens.identity(), local(&std::env::temp_dir())),
             Duration::from_secs(60),
         )
         .await;
@@ -2169,7 +2791,7 @@ mod tests {
         let req = http(
             "POST",
             "127.0.0.1",
-            Some(&format!("Bearer {TOKEN}")),
+            Some(&format!("Bearer {}", token_for("sb-a"))),
             "",
             INIT,
         )
@@ -2259,12 +2881,13 @@ mod tests {
         assert!(!dir.path().join("evil").exists());
     }
 
-    async fn cluster_broker(dir: &Path, max_builds: usize) -> Arc<Broker> {
-        cluster_broker_with_deadline(dir, max_builds, 900).await
+    async fn cluster_broker(dir: &Path, tokens: &Tokens, max_builds: usize) -> Arc<Broker> {
+        cluster_broker_with_deadline(dir, tokens, max_builds, 900).await
     }
 
     async fn cluster_broker_with_deadline(
         dir: &Path,
+        tokens: &Tokens,
         max_builds: usize,
         deadline_secs: i64,
     ) -> Arc<Broker> {
@@ -2275,9 +2898,8 @@ mod tests {
         Arc::new(Broker {
             client,
             namespace,
-            workspace: Workspace::Local {
-                dir: dir.to_path_buf(),
-            },
+            identity: tokens.identity(),
+            workspace: local(dir),
             backend: Backend::Buildah,
             resources: Resources::default(),
             deadline_secs,
@@ -2302,6 +2924,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
+        let tokens = Tokens::all();
         write(
             &dir.join("svc/Dockerfile"),
             "FROM docker.io/library/busybox:latest\n\
@@ -2313,8 +2936,12 @@ mod tests {
              RUN echo 'main.c:3: undefined reference to frob' && exit 3\n",
         );
 
-        let first = start(cluster_broker(&dir, 2).await, Duration::from_secs(5)).await;
-        let a = client(&first.addr, TOKEN, Some("sb-a")).await.unwrap();
+        let first = start(
+            cluster_broker(&dir, &tokens, 2).await,
+            Duration::from_secs(5),
+        )
+        .await;
+        let a = client(&first.addr, &token_for("sb-a")).await.unwrap();
         let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
         assert_eq!(built["exit"], 0, "{built}");
         assert_eq!(built["runnable"], true, "{built}");
@@ -2335,7 +2962,7 @@ mod tests {
         );
         assert!(dir.join(format!(".buildit/{id}/build.log")).is_file());
 
-        let broker = cluster_broker(&dir, 2).await;
+        let broker = cluster_broker(&dir, &tokens, 2).await;
         let pods = broker
             .list(&[("buildit.dev/build-id", id.as_str())])
             .await
@@ -2392,7 +3019,7 @@ mod tests {
         );
         assert!(dir.join(format!(".buildit/{id}/run-1.log")).is_file());
 
-        let a = client(&second.addr, TOKEN, Some("sb-a")).await.unwrap();
+        let a = client(&second.addr, &token_for("sb-a")).await.unwrap();
         let ran = call_ok(
             &a,
             "run",
@@ -2468,7 +3095,7 @@ mod tests {
         assert!(e.contains("no run:9 log"), "{e}");
 
         // another sandbox sees nothing of sb-a's build
-        let b = client(&second.addr, TOKEN, Some("sb-b")).await.unwrap();
+        let b = client(&second.addr, &token_for("sb-b")).await.unwrap();
         for (tool, args) in [
             (
                 "run",
@@ -2523,7 +3150,7 @@ mod tests {
         assert_eq!(cleaned["deleted"], serde_json::json!([other_id]));
         for sandbox in ["sb-a", "sb-b"] {
             let name = SandboxName::parse(sandbox).unwrap();
-            let broker = cluster_broker(&dir, 2).await;
+            let broker = cluster_broker(&dir, &tokens, 2).await;
             assert!(broker.live_builds(&name).await.unwrap().is_empty());
         }
         let e = call_err(&a, "logs", serde_json::json!({ "build_id": id })).await;
@@ -2569,15 +3196,20 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
+        let tokens = Tokens::all();
         write(
             &dir.join("slow/Dockerfile"),
             "FROM docker.io/library/busybox:latest\nRUN sleep 600\n",
         );
-        let probe = cluster_broker(&dir, 4).await;
+        let probe = cluster_broker(&dir, &tokens, 4).await;
         let build = serde_json::json!({ "context": "slow" });
 
         // the client goes away mid-build
-        let server = start(cluster_broker(&dir, 4).await, Duration::from_secs(5)).await;
+        let server = start(
+            cluster_broker(&dir, &tokens, 4).await,
+            Duration::from_secs(5),
+        )
+        .await;
         let addr = server.addr.clone();
         let args = build.clone();
         let call = tokio::spawn(async move { raw_call(&addr, "sb-gone", "build", args).await });
@@ -2597,8 +3229,8 @@ mod tests {
         let req = http(
             "POST",
             "127.0.0.1",
-            Some(&format!("Bearer {TOKEN}")),
-            &format!("{SANDBOX_HEADER}: sb-down\r\n"),
+            Some(&format!("Bearer {}", token_for("sb-down"))),
+            "",
             &jsonrpc(
                 7,
                 "tools/call",
@@ -2756,17 +3388,18 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
+        let tokens = Tokens::all();
         write(
             &dir.join("svc/Dockerfile"),
             "FROM docker.io/library/busybox:latest\nRUN echo hi\n",
         );
         let server = start(
-            cluster_broker_with_deadline(&dir, 2, 45).await,
+            cluster_broker_with_deadline(&dir, &tokens, 2, 45).await,
             Duration::from_secs(5),
         )
         .await;
-        let probe = cluster_broker(&dir, 2).await;
-        let a = client(&server.addr, TOKEN, Some("sb-old")).await.unwrap();
+        let probe = cluster_broker(&dir, &tokens, 2).await;
+        let a = client(&server.addr, &token_for("sb-old")).await.unwrap();
         let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
         let id = built["build_id"].as_str().unwrap().to_string();
         wait_until("the builder to pass its deadline", 120, async || {
@@ -2794,7 +3427,7 @@ mod tests {
         .await;
 
         // any sandbox's build sweeps ended builder pods
-        let b = client(&server.addr, TOKEN, Some("sb-new")).await.unwrap();
+        let b = client(&server.addr, &token_for("sb-new")).await.unwrap();
         let fresh = call_ok(&b, "build", serde_json::json!({ "context": "svc" })).await;
         assert_eq!(fresh["exit"], 0, "{fresh}");
         assert!(all_deleting(&sandbox_pods(&probe, "sb-old").await));
