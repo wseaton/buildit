@@ -785,7 +785,7 @@ impl Broker {
 
     // pods of other sandboxes look exactly like missing ones
     async fn find(&self, caller: &SandboxName, id: &BuildId) -> Result<LiveBuild> {
-        let gone = || anyhow!("no live build {id:?}; build again");
+        let gone = || anyhow!("no live build {id}; build again");
         let pods = self
             .list(&[
                 (LABEL_MANAGED_BY, MANAGED_BY),
@@ -2288,7 +2288,7 @@ mod tests {
             assert!(broker.live_builds(&name).await.unwrap().is_empty());
         }
         let e = call_err(&a, "logs", serde_json::json!({ "build_id": id })).await;
-        assert!(e.contains("no live build"), "{e}");
+        assert_eq!(e, format!("no live build {id}; build again"));
 
         a.cancel().await.unwrap();
         b.cancel().await.unwrap();
