@@ -22,6 +22,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::backend::{Backend, PodOpts, Resources};
 use crate::build::POD_READY_TIMEOUT;
@@ -38,6 +39,8 @@ const DEFAULT_RUN_TIMEOUT_S: u64 = 600;
 const LOG_TAIL_LINES: usize = 60;
 const LOG_TAIL_BYTES: usize = 8 * 1024;
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const CLEAN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -120,18 +123,68 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         broker.namespace,
         broker.backend
     );
-    let app = router(broker.clone(), token, allowed_hosts(env_hosts().as_deref()));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving buildit mcp")?;
-    let deleted = broker.clean(None, None).await;
+    let hosts = allowed_hosts(env_hosts().as_deref());
+    let deleted = serve_until(
+        listener,
+        broker,
+        token,
+        hosts,
+        shutdown_signal()?,
+        SHUTDOWN_GRACE,
+    )
+    .await?;
     tracing::info!("deleted {} builder pod(s) on shutdown", deleted.len());
     Ok(())
 }
 
-pub fn router(broker: Arc<Broker>, token: String, hosts: Vec<String>) -> axum::Router {
-    let config = StreamableHttpServerConfig::default().with_allowed_hosts(hosts);
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    broker: Arc<Broker>,
+    token: String,
+    hosts: Vec<String>,
+    shutdown: impl Future<Output = ()>,
+    grace: Duration,
+) -> Result<Vec<String>> {
+    let ct = CancellationToken::new();
+    let app = router(broker.clone(), token, hosts, ct.clone());
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(ct.clone().cancelled_owned())
+        .into_future();
+    tokio::pin!(server);
+    let served = tokio::select! {
+        result = &mut server => result,
+        () = shutdown => {
+            tracing::info!("shutting down; closing open streams");
+            ct.cancel();
+            match tokio::time::timeout(grace, &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("connections still open after {grace:?}; exiting anyway");
+                    Ok(())
+                }
+            }
+        }
+    };
+    let deleted = match tokio::time::timeout(CLEAN_TIMEOUT, broker.clean(None, None)).await {
+        Ok(deleted) => deleted,
+        Err(_) => {
+            tracing::warn!("deleting builder pods timed out after {CLEAN_TIMEOUT:?}");
+            Vec::new()
+        }
+    };
+    served.context("serving buildit mcp")?;
+    Ok(deleted)
+}
+
+pub fn router(
+    broker: Arc<Broker>,
+    token: String,
+    hosts: Vec<String>,
+    ct: CancellationToken,
+) -> axum::Router {
+    let config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(hosts)
+        .with_cancellation_token(ct);
     let service: StreamableHttpService<BuilditMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(BuilditMcp::new(broker.clone())),
@@ -146,22 +199,15 @@ pub fn router(broker: Arc<Broker>, token: String, hosts: Vec<String>) -> axum::R
         ))
 }
 
-async fn shutdown_signal() {
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(e) => {
-                tracing::warn!("no SIGTERM handler ({e}); ctrl-c only");
-                std::future::pending::<()>().await;
-            }
+fn shutdown_signal() -> Result<impl Future<Output = ()>> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term => {}
-    }
+    })
 }
 
 async fn kube_client(
@@ -850,12 +896,15 @@ mod tests {
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
-    use crate::backend::{Backend, Resources};
+    use crate::backend::{Backend, PodOpts, Resources};
     use crate::mcp::{
-        Broker, BuildParams, BuildRequest, MCP_PATH, SANDBOX_HEADER, allowed_hosts, authorized,
-        constant_time_eq, fetch_argv, from_argv, rm_argv, router, run_argv, tail, unpack_fetched,
+        Broker, BuildParams, BuildRequest, MCP_PATH, SANDBOX_HEADER, Session, allowed_hosts,
+        authorized, constant_time_eq, fetch_argv, from_argv, rm_argv, router, run_argv,
+        serve_until, shutdown_signal, tail, unpack_fetched,
     };
+    use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, Workspace};
 
     const TOKEN: &str = "s3cr3t-token";
@@ -1092,7 +1141,11 @@ mod tests {
     }
 
     fn broker(workspace: Workspace) -> Arc<Broker> {
-        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        broker_at(workspace, "http://127.0.0.1:9")
+    }
+
+    fn broker_at(workspace: Workspace, api: &str) -> Arc<Broker> {
+        let config = kube::Config::new(api.parse().unwrap());
         Arc::new(Broker {
             client: kube::Client::try_from(config).unwrap(),
             namespace: "builds".to_string(),
@@ -1109,7 +1162,12 @@ mod tests {
 
     async fn serve(workspace: Workspace) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let app = router(broker(workspace), TOKEN.to_string(), allowed_hosts(None));
+        let app = router(
+            broker(workspace),
+            TOKEN.to_string(),
+            allowed_hosts(None),
+            CancellationToken::new(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1296,5 +1354,175 @@ mod tests {
     #[test]
     fn local_tag_is_not_pushable() {
         assert!(Path::new(&crate::mcp::local_tag("buildit-1")).starts_with("localhost"));
+    }
+
+    async fn apiserver() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::extract::{Path as UrlPath, State};
+        use axum::http::{StatusCode, header};
+        use axum::routing::{delete, post};
+        type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+        type Reply = (StatusCode, [(header::HeaderName, &'static str); 1], String);
+        async fn create(State(seen): State<Seen>, pod: String) -> Reply {
+            seen.lock().unwrap().push("POST pods".to_string());
+            (
+                StatusCode::CREATED,
+                [(header::CONTENT_TYPE, "application/json")],
+                pod,
+            )
+        }
+        async fn remove(
+            State(seen): State<Seen>,
+            UrlPath((ns, name)): UrlPath<(String, String)>,
+        ) -> Reply {
+            seen.lock().unwrap().push(format!("DELETE {ns}/{name}"));
+            let pod = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": name, "namespace": ns },
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                pod.to_string(),
+            )
+        }
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/v1/namespaces/{ns}/pods", post(create))
+            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(remove))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    async fn exchange(addr: &str, req: String) -> String {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut out))
+            .await
+            .expect("response did not finish")
+            .unwrap();
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn post(body: &str, session: Option<&str>) -> String {
+        let session = session
+            .map(|s| format!("Mcp-Session-Id: {s}\r\nMCP-Protocol-Version: 2025-06-18\r\n"))
+            .unwrap_or_default();
+        format!(
+            "POST {MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\n\
+             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+             {session}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn open_sse(addr: &str) -> tokio::net::TcpStream {
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let reply = exchange(addr, post(init, None)).await;
+        let session = reply
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("mcp-session-id:")
+                    .map(|_| l["mcp-session-id:".len()..].trim().to_string())
+            })
+            .unwrap_or_else(|| panic!("no session id in {reply}"));
+        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let reply = exchange(addr, post(note, Some(&session))).await;
+        assert!(reply.starts_with("HTTP/1.1 202"), "{reply}");
+
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let get = format!(
+            "GET {MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\n\
+             Accept: text/event-stream\r\nMcp-Session-Id: {session}\r\n\
+             MCP-Protocol-Version: 2025-06-18\r\n\r\n"
+        );
+        sock.write_all(get.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(n > 0, "sse stream closed before its headers");
+            head.extend_from_slice(&buf[..n]);
+        }
+        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 200"), "{head}");
+        assert!(head.contains("text/event-stream"), "{head}");
+        sock
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sigterm_closes_open_streams_and_deletes_builder_pods() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (api, seen) = apiserver().await;
+        let broker = broker_at(
+            Workspace::Local {
+                dir: std::env::temp_dir(),
+            },
+            &api,
+        );
+        let resources = Resources::default();
+        let opts = PodOpts {
+            idle_nodes: &[],
+            resources: &resources,
+            cache: None,
+            node: None,
+            deadline_secs: 600,
+            owner: None,
+        };
+        let pod = BuilderPod::create_named(
+            broker.client.clone(),
+            "builds",
+            Backend::Buildah,
+            "buildit-term",
+            &opts,
+        )
+        .await
+        .unwrap();
+        broker
+            .keep(Session {
+                id: "buildit-term".to_string(),
+                pod,
+                sandbox: None,
+            })
+            .await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(serve_until(
+            listener,
+            broker,
+            TOKEN.to_string(),
+            allowed_hosts(None),
+            shutdown_signal().unwrap(),
+            Duration::from_secs(60),
+        ));
+        let mut sse = open_sse(&addr).await;
+
+        let killed = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+
+        let deleted = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server did not exit within 5s of SIGTERM")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted, ["buildit-term"]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["POST pods", "DELETE builds/buildit-term"]
+        );
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sse.read_to_end(&mut rest))
+            .await
+            .expect("sse stream stayed open")
+            .unwrap();
     }
 }
