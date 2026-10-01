@@ -31,7 +31,7 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "signal", "io-util", "io-std", "time", "net", "fs"] }
-tokio-util = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

@@ -5,6 +5,7 @@ use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 pub const BACKEND_LABEL: &str = "buildit/backend";
+const LOG_VOLUME_LIMIT: &str = "1Gi";
 
 #[derive(Clone, Copy)]
 pub enum CacheVolume<'a> {
@@ -442,7 +443,10 @@ impl Backend {
                 let vols = spec["spec"]["volumes"]
                     .as_array_mut()
                     .ok_or_else(|| anyhow!("pod volumes are not a list"))?;
-                vols.push(serde_json::json!({ "name": "buildit-logs", "emptyDir": {} }));
+                vols.push(serde_json::json!({
+                    "name": "buildit-logs",
+                    "emptyDir": { "sizeLimit": LOG_VOLUME_LIMIT }
+                }));
                 let mounts = &mut spec["spec"]["containers"][0]["volumeMounts"];
                 if mounts.is_null() {
                     *mounts = serde_json::json!([]);
@@ -1225,10 +1229,16 @@ mod tests {
             assert!(notes.contains_key("container.apparmor.security.beta.kubernetes.io/builder"));
             let spec = pod.spec.unwrap();
             let vols = spec.volumes.unwrap();
-            assert!(
-                vols.iter()
-                    .any(|v| v.name == "buildit-logs" && v.empty_dir.is_some()),
-                "{backend:?}"
+            let logs = vols
+                .iter()
+                .find(|v| v.name == "buildit-logs")
+                .and_then(|v| v.empty_dir.as_ref())
+                .unwrap_or_else(|| panic!("{backend:?} has no log emptyDir"));
+            assert_eq!(
+                logs.size_limit,
+                Some(k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+                    crate::backend::LOG_VOLUME_LIMIT.to_string()
+                ))
             );
             let mounts = spec.containers[0].volume_mounts.clone().unwrap();
             assert!(

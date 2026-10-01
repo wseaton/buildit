@@ -24,6 +24,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::backend::{BACKEND_LABEL, Backend, PodMeta, PodOpts, Resources};
 use crate::build::POD_READY_TIMEOUT;
@@ -59,6 +60,8 @@ const EXEC_SLACK: Duration = Duration::from_secs(60);
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MAX_OWNER_DEPTH: usize = 4;
+const DELETE_GRACE_S: u32 = 1;
+const CALL_DRAIN: Duration = Duration::from_secs(20);
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -128,6 +131,7 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         deadline_secs: args.pod_deadline,
         max_builds: args.max_builds.max(1),
         owner,
+        calls: TaskTracker::new(),
     });
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -160,6 +164,7 @@ async fn serve_until(
     grace: Duration,
 ) -> Result<()> {
     let ct = CancellationToken::new();
+    let calls = broker.calls.clone();
     let app = router(broker, token, hosts, ct.clone());
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(ct.clone().cancelled_owned())
@@ -179,6 +184,13 @@ async fn serve_until(
             }
         }
     };
+    calls.close();
+    if tokio::time::timeout(CALL_DRAIN, calls.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("{} calls still running after {CALL_DRAIN:?}", calls.len());
+    }
     served.context("serving buildit mcp")
 }
 
@@ -483,6 +495,13 @@ fn within_cap(live: &[Pod], cap: usize, id: &BuildId) -> bool {
     older < cap
 }
 
+fn delete_params() -> DeleteParams {
+    DeleteParams {
+        grace_period_seconds: Some(DELETE_GRACE_S),
+        ..DeleteParams::default()
+    }
+}
+
 fn pod_labels(caller: &SandboxName, id: &BuildId) -> Vec<(String, String)> {
     [
         (LABEL_MANAGED_BY, MANAGED_BY),
@@ -516,6 +535,8 @@ pub struct Broker {
     deadline_secs: i64,
     max_builds: usize,
     owner: Option<OwnerReference>,
+    // in-flight tool calls, drained on shutdown
+    calls: TaskTracker,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -857,6 +878,26 @@ impl Broker {
         )
     }
 
+    // deletes every sandbox's ended builder pods
+    async fn sweep_ended(&self) {
+        let pods = match self.list(&[(LABEL_MANAGED_BY, MANAGED_BY)]).await {
+            Ok(pods) => pods,
+            Err(e) => {
+                tracing::warn!("sweeping ended builder pods: {e:#}");
+                return;
+            }
+        };
+        for pod in pods
+            .iter()
+            .filter(|p| !alive(p) && p.metadata.deletion_timestamp.is_none())
+        {
+            let name = pod_name(pod);
+            if let Err(e) = self.pods().delete(name, &delete_params()).await {
+                tracing::warn!("deleting ended builder pod {name}: {e:#}");
+            }
+        }
+    }
+
     // pods of other sandboxes look exactly like missing ones
     async fn find(&self, caller: &SandboxName, id: &BuildId) -> Result<LiveBuild> {
         let gone = || anyhow!("no live build {id}; build again");
@@ -871,7 +912,12 @@ impl Broker {
             .find(|p| owned_by(p, caller) && p.metadata.deletion_timestamp.is_none())
             .ok_or_else(gone)?;
         if !alive(&pod) {
-            bail!("build {id} expired (builder pod deadline); build again");
+            let why = pod
+                .status
+                .as_ref()
+                .and_then(|s| s.reason.as_deref())
+                .unwrap_or("pod ended");
+            bail!("build {id} is gone ({why}); build again");
         }
         let backend = label(&pod, BACKEND_LABEL)
             .and_then(Backend::from_label)
@@ -926,8 +972,14 @@ impl Broker {
         summarize(&text, log, results_path(id, &file), failed)
     }
 
-    pub async fn build(&self, caller: &SandboxName, params: BuildParams) -> Result<BuildReply> {
+    pub async fn build(
+        &self,
+        caller: &SandboxName,
+        params: BuildParams,
+        ct: &CancellationToken,
+    ) -> Result<BuildReply> {
         let req = BuildRequest::parse(params)?;
+        self.sweep_ended().await;
         self.check_cap(caller, None).await?;
         let id = BuildId::fresh();
         let stage = tempfile::tempdir().context("creating staging dir")?;
@@ -967,29 +1019,43 @@ impl Broker {
             &opts,
         )
         .await?;
-        let ready = async {
-            self.check_cap(caller, Some(&id)).await?;
-            pod.wait_ready(POD_READY_TIMEOUT).await
+        let reply = tokio::select! {
+            biased;
+            () = ct.cancelled() => Err(anyhow!("call cancelled")),
+            reply = self.finish_build(caller, &pod, &id, &req, &tarball, &results) => reply,
         };
-        if let Err(e) = ready.await {
-            if let Err(del) = pod.delete().await {
-                tracing::warn!("deleting builder pod {id}: {del:#}");
-            }
-            return Err(e);
+        if reply.is_err()
+            && let Err(e) = self.pods().delete(&pod.name, &delete_params()).await
+        {
+            tracing::warn!("deleting builder pod {id}: {e:#}");
         }
+        reply
+    }
+
+    async fn finish_build(
+        &self,
+        caller: &SandboxName,
+        pod: &BuilderPod,
+        id: &BuildId,
+        req: &BuildRequest,
+        tarball: &[u8],
+        results: &Path,
+    ) -> Result<BuildReply> {
+        self.check_cap(caller, Some(id)).await?;
+        pod.wait_ready(POD_READY_TIMEOUT).await?;
 
         let started = Instant::now();
         let outcome = step_outcome(
             tokio::time::timeout(
                 req.timeout + EXEC_SLACK,
-                self.drive_build(&pod, &req, &tarball),
+                self.drive_build(pod, req, tarball),
             )
             .await,
             req.timeout,
             started.elapsed(),
         );
         if let Some(line) = &outcome.error {
-            self.note(&pod, self.backend, LogName::Build, line).await;
+            self.note(pod, self.backend, LogName::Build, line).await;
         }
         let state = if outcome.success() {
             BuildState::Built
@@ -1002,15 +1068,15 @@ impl Broker {
         }
         let log = self
             .collect_log(
-                &pod,
+                pod,
                 self.backend,
                 LogName::Build,
-                &id,
-                &results,
+                id,
+                results,
                 !outcome.success(),
             )
             .await?;
-        self.publish(caller, &results).await?;
+        self.publish(caller, results).await?;
         Ok(BuildReply {
             runnable: outcome.success() && labelled.is_ok() && self.backend == Backend::Buildah,
             build_id: id.to_string(),
@@ -1193,7 +1259,7 @@ impl Broker {
                 continue;
             }
             let name = pod_name(&pod);
-            match self.pods().delete(name, &DeleteParams::default()).await {
+            match self.pods().delete(name, &delete_params()).await {
                 Ok(_) => deleted.push(label(&pod, LABEL_BUILD_ID).unwrap_or(name).to_string()),
                 Err(e) => tracing::warn!("deleting builder pod {name}: {e:#}"),
             }
@@ -1206,6 +1272,17 @@ impl Broker {
 #[derive(Clone)]
 pub struct BuilditMcp {
     broker: Arc<Broker>,
+}
+
+async fn cancellable<T>(
+    ct: &CancellationToken,
+    work: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        () = ct.cancelled() => Err(anyhow!("call cancelled")),
+        result = work => result,
+    }
 }
 
 fn reply<T: Serialize>(result: Result<T>) -> Result<String, String> {
@@ -1229,13 +1306,15 @@ impl BuilditMcp {
     async fn build(
         &self,
         Extension(parts): Extension<Parts>,
+        ct: CancellationToken,
         Parameters(params): Parameters<BuildParams>,
     ) -> Result<String, String> {
+        let _call = self.broker.calls.token();
         let broker = &self.broker;
         reply(
             async {
                 let caller = broker.caller(&parts)?;
-                broker.build(&caller, params).await
+                broker.build(&caller, params, &ct).await
             }
             .await,
         )
@@ -1249,14 +1328,16 @@ impl BuilditMcp {
     async fn run(
         &self,
         Extension(parts): Extension<Parts>,
+        ct: CancellationToken,
         Parameters(params): Parameters<RunParams>,
     ) -> Result<String, String> {
+        let _call = self.broker.calls.token();
         let broker = &self.broker;
         reply(
-            async {
+            cancellable(&ct, async {
                 let caller = broker.caller(&parts)?;
                 broker.run(&caller, params).await
-            }
+            })
             .await,
         )
     }
@@ -1271,14 +1352,16 @@ impl BuilditMcp {
     async fn logs(
         &self,
         Extension(parts): Extension<Parts>,
+        ct: CancellationToken,
         Parameters(params): Parameters<LogsParams>,
     ) -> Result<String, String> {
+        let _call = self.broker.calls.token();
         let broker = &self.broker;
         reply(
-            async {
+            cancellable(&ct, async {
                 let caller = broker.caller(&parts)?;
                 broker.logs(&caller, params).await
-            }
+            })
             .await,
         )
     }
@@ -1287,15 +1370,17 @@ impl BuilditMcp {
     async fn clean(
         &self,
         Extension(parts): Extension<Parts>,
+        ct: CancellationToken,
         Parameters(params): Parameters<CleanParams>,
     ) -> Result<String, String> {
+        let _call = self.broker.calls.token();
         let broker = &self.broker;
         reply(
-            async {
+            cancellable(&ct, async {
                 let caller = broker.caller(&parts)?;
                 let deleted = broker.clean(&caller, params.build_id.as_deref()).await?;
                 Ok(CleanReply { deleted })
-            }
+            })
             .await,
         )
     }
@@ -1657,6 +1742,7 @@ mod tests {
             deadline_secs: 600,
             max_builds: 2,
             owner: None,
+            calls: tokio_util::task::TaskTracker::new(),
         })
     }
 
@@ -2174,6 +2260,14 @@ mod tests {
     }
 
     async fn cluster_broker(dir: &Path, max_builds: usize) -> Arc<Broker> {
+        cluster_broker_with_deadline(dir, max_builds, 900).await
+    }
+
+    async fn cluster_broker_with_deadline(
+        dir: &Path,
+        max_builds: usize,
+        deadline_secs: i64,
+    ) -> Arc<Broker> {
         let ctx = std::env::var("BUILDIT_E2E_KUBECONTEXT")
             .expect("set BUILDIT_E2E_KUBECONTEXT to a disposable cluster's context");
         let ns = std::env::var("BUILDIT_E2E_NAMESPACE").unwrap_or_else(|_| "default".to_string());
@@ -2186,9 +2280,10 @@ mod tests {
             },
             backend: Backend::Buildah,
             resources: Resources::default(),
-            deadline_secs: 900,
+            deadline_secs,
             max_builds,
             owner: None,
+            calls: tokio_util::task::TaskTracker::new(),
         })
     }
 
@@ -2439,6 +2534,13 @@ mod tests {
         second.shut_down().await;
     }
 
+    async fn sandbox_pods(broker: &Broker, sandbox: &str) -> Vec<Pod> {
+        broker
+            .list(&[("buildit.dev/sandbox", sandbox)])
+            .await
+            .unwrap()
+    }
+
     async fn wait_until(what: &str, secs: u64, mut done: impl AsyncFnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
         while !done().await {
@@ -2447,6 +2549,77 @@ mod tests {
                 "timed out waiting for {what}"
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn running(pods: &[Pod]) -> bool {
+        pods.iter().any(|p| {
+            p.metadata.deletion_timestamp.is_none()
+                && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+        })
+    }
+
+    fn all_deleting(pods: &[Pod]) -> bool {
+        pods.iter().all(|p| p.metadata.deletion_timestamp.is_some())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_a_build_nobody_hears_back_from_deletes_its_pod() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        write(
+            &dir.join("slow/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nRUN sleep 600\n",
+        );
+        let probe = cluster_broker(&dir, 4).await;
+        let build = serde_json::json!({ "context": "slow" });
+
+        // the client goes away mid-build
+        let server = start(cluster_broker(&dir, 4).await, Duration::from_secs(5)).await;
+        let addr = server.addr.clone();
+        let args = build.clone();
+        let call = tokio::spawn(async move { raw_call(&addr, "sb-gone", "build", args).await });
+        wait_until("a running builder for sb-gone", 180, async || {
+            running(&sandbox_pods(&probe, "sb-gone").await)
+        })
+        .await;
+        call.abort();
+        let _ = call.await;
+        wait_until("sb-gone's builder to be deleted", 30, async || {
+            all_deleting(&sandbox_pods(&probe, "sb-gone").await)
+        })
+        .await;
+
+        // the server shuts down mid-build: it waits for the pod delete
+        let addr = server.addr.clone();
+        let req = http(
+            "POST",
+            "127.0.0.1",
+            Some(&format!("Bearer {TOKEN}")),
+            &format!("{SANDBOX_HEADER}: sb-down\r\n"),
+            &jsonrpc(
+                7,
+                "tools/call",
+                serde_json::json!({ "name": "build", "arguments": build }),
+            ),
+        );
+        let call = tokio::spawn(async move { exchange(&addr, req).await });
+        wait_until("a running builder for sb-down", 180, async || {
+            running(&sandbox_pods(&probe, "sb-down").await)
+        })
+        .await;
+        server.shut_down().await;
+        assert!(all_deleting(&sandbox_pods(&probe, "sb-down").await));
+        let reply = call.await.unwrap();
+        assert_eq!(reply.status, 500, "{}", reply.body);
+
+        for sandbox in ["sb-gone", "sb-down"] {
+            wait_until("builder pods to go", 60, async || {
+                sandbox_pods(&probe, sandbox).await.is_empty()
+            })
+            .await;
         }
     }
 
@@ -2575,5 +2748,62 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_builds_past_their_deadline_say_so_and_get_swept() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        write(
+            &dir.join("svc/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nRUN echo hi\n",
+        );
+        let server = start(
+            cluster_broker_with_deadline(&dir, 2, 45).await,
+            Duration::from_secs(5),
+        )
+        .await;
+        let probe = cluster_broker(&dir, 2).await;
+        let a = client(&server.addr, TOKEN, Some("sb-old")).await.unwrap();
+        let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        let id = built["build_id"].as_str().unwrap().to_string();
+        wait_until("the builder to pass its deadline", 120, async || {
+            sandbox_pods(&probe, "sb-old")
+                .await
+                .iter()
+                .any(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed"))
+        })
+        .await;
+        let e = call_err(&a, "logs", serde_json::json!({ "build_id": id })).await;
+        assert_eq!(
+            e,
+            format!("build {id} is gone (DeadlineExceeded); build again")
+        );
+        let cleaned = call_ok(&a, "clean", serde_json::json!({})).await;
+        assert_eq!(cleaned["deleted"], serde_json::json!([id]));
+        let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        let second = built["build_id"].as_str().unwrap().to_string();
+        wait_until("the second builder to pass its deadline", 120, async || {
+            sandbox_pods(&probe, "sb-old").await.iter().any(|p| {
+                p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed")
+                    && p.metadata.deletion_timestamp.is_none()
+            })
+        })
+        .await;
+
+        // any sandbox's build sweeps ended builder pods
+        let b = client(&server.addr, TOKEN, Some("sb-new")).await.unwrap();
+        let fresh = call_ok(&b, "build", serde_json::json!({ "context": "svc" })).await;
+        assert_eq!(fresh["exit"], 0, "{fresh}");
+        assert!(all_deleting(&sandbox_pods(&probe, "sb-old").await));
+        let e = call_err(&a, "logs", serde_json::json!({ "build_id": second })).await;
+        assert_eq!(e, format!("no live build {second}; build again"));
+
+        call_ok(&b, "clean", serde_json::json!({})).await;
+        a.cancel().await.unwrap();
+        b.cancel().await.unwrap();
+        server.shut_down().await;
     }
 }

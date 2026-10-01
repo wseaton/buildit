@@ -150,13 +150,15 @@ JSON, and nothing about a build lives in server memory. Builder pods carry
 `buildit.dev/managed-by=mcp`, `buildit.dev/build-id`, `buildit.dev/sandbox`,
 and `buildit.dev/state` labels, and every lookup goes through them, so a
 restarted server or a second replica keeps serving existing builds. Logs are
-appended inside the pod under `/buildit/logs` by the commands themselves;
-copies land at `.buildit/<build_id>/build.log` and `run-<n>.log`. A sandbox
-may hold `--max-builds` live builder pods (default 4); past that `build` is
-refused until `clean`. Builder pods are not deleted on shutdown: they go with
-the serving workload (an ownerReference to the top of the serving pod's
-controller chain, e.g. its Deployment, which takes `get` on that chain's
-kinds), at `--pod-deadline`, or on `clean`.
+appended inside the pod under `/buildit/logs` (a 1Gi emptyDir) by the commands
+themselves; copies of their last 32 MiB land at `.buildit/<build_id>/build.log`
+and `run-<n>.log`. A sandbox may hold `--max-builds` live builder pods
+(default 4); past that `build` is refused until `clean`. A `build` call that
+returns an error, or is cut off by a disconnect or shutdown, deletes its pod;
+other builder pods survive a shutdown and go with the serving workload (an
+ownerReference to the top of the serving pod's controller chain, e.g. its
+Deployment, which takes `get` on that chain's kinds), at `--pod-deadline`, or
+on `clean`. Pods that end at the deadline are deleted by the next `build`.
 
 Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
 `X-Crucible-Sandbox` header naming the sandbox; a build is only visible to the
