@@ -690,14 +690,21 @@ fn results_path(id: &BuildId, file: &str) -> String {
     format!("{RESULTS_DIR}/{id}/{file}")
 }
 
-// exit code and timeout flag from a step run under `timeout`
-fn step_outcome(status: Result<Result<ExecStatus>, tokio::time::error::Elapsed>) -> StepOutcome {
+// a step that fails at or past its limit timed out
+fn step_outcome(
+    status: Result<Result<ExecStatus>, tokio::time::error::Elapsed>,
+    limit: Duration,
+    elapsed: Duration,
+) -> StepOutcome {
     match status {
-        Ok(Ok(s)) => StepOutcome {
-            exit: s.code,
-            timed_out: s.code == Some(124),
-            error: None,
-        },
+        Ok(Ok(s)) => {
+            let timed_out = !s.success() && elapsed >= limit;
+            StepOutcome {
+                exit: s.code,
+                timed_out,
+                error: timed_out.then(|| format!("buildit: timed out after {}s", limit.as_secs())),
+            }
+        }
         Ok(Err(e)) => StepOutcome {
             exit: None,
             timed_out: false,
@@ -907,12 +914,15 @@ impl Broker {
             return Err(e);
         }
 
+        let started = Instant::now();
         let outcome = step_outcome(
             tokio::time::timeout(
                 req.timeout + EXEC_SLACK,
                 self.drive_build(&pod, &req, &tarball),
             )
             .await,
+            req.timeout,
+            started.elapsed(),
         );
         if let Some(line) = &outcome.error {
             self.note(&pod, self.backend, LogName::Build, line).await;
@@ -1004,9 +1014,11 @@ impl Broker {
         let n = parse_run_number(&pod.exec_capture(&alloc_run_argv(shell)).await?)?;
         let log = LogName::Run(n);
         let ctr = format!("{id}-run{n}");
+        let from_limit = Duration::from_secs(FROM_TIMEOUT_S);
+        let started = Instant::now();
         let from = step_outcome(
             tokio::time::timeout(
-                Duration::from_secs(FROM_TIMEOUT_S) + EXEC_SLACK,
+                from_limit + EXEC_SLACK,
                 pod.exec_status(&step_argv(
                     shell,
                     log,
@@ -1015,8 +1027,11 @@ impl Broker {
                 )),
             )
             .await,
+            from_limit,
+            started.elapsed(),
         );
         let outcome = if from.success() {
+            let started = Instant::now();
             step_outcome(
                 tokio::time::timeout(
                     limit + EXEC_SLACK,
@@ -1028,6 +1043,8 @@ impl Broker {
                     )),
                 )
                 .await,
+                limit,
+                started.elapsed(),
             )
         } else {
             from
@@ -1247,7 +1264,8 @@ mod tests {
     use crate::mcp::{
         Broker, BuildId, BuildParams, BuildRequest, LABEL_BUILD_ID, MCP_PATH, SANDBOX_HEADER,
         alive, allowed_hosts, authorized, constant_time_eq, fetch_argv, from_argv, kube_client,
-        owned_by, rm_argv, router, run_argv, selector, serve_until, unpack_fetched, within_cap,
+        owned_by, rm_argv, router, run_argv, selector, serve_until, step_outcome, unpack_fetched,
+        within_cap,
     };
     use crate::sandbox::{RelPath, SandboxName, Workspace};
 
@@ -1519,6 +1537,48 @@ mod tests {
         ];
         assert!(within_cap(&earlier, 1, &id("buildit-x")));
         assert!(!within_cap(&earlier, 1, &id("buildit-y")));
+    }
+
+    #[tokio::test]
+    async fn timeouts_come_from_the_clock_not_the_exit_code() {
+        let limit = Duration::from_secs(60);
+        let exited = |code: i32| {
+            Ok(Ok(crate::pod::ExecStatus {
+                code: Some(code),
+                message: String::new(),
+            }))
+        };
+        let at = Duration::from_secs;
+
+        let quick_124 = step_outcome(exited(124), limit, at(3));
+        assert_eq!((quick_124.exit, quick_124.timed_out), (Some(124), false));
+        assert_eq!(quick_124.error, None);
+        for code in [124, 143, 137] {
+            let killed = step_outcome(exited(code), limit, at(60));
+            assert_eq!((killed.exit, killed.timed_out), (Some(code), true));
+            assert_eq!(
+                killed.error.as_deref(),
+                Some("buildit: timed out after 60s")
+            );
+        }
+        let ok_late = step_outcome(exited(0), limit, at(61));
+        assert!(ok_late.success() && !ok_late.timed_out && ok_late.error.is_none());
+
+        let failed = step_outcome(Ok(Err(anyhow::anyhow!("exec broke"))), limit, at(1));
+        assert!(!failed.timed_out && failed.exit.is_none());
+        assert_eq!(failed.error.as_deref(), Some("buildit: exec broke"));
+
+        let hung = tokio::time::timeout(
+            Duration::ZERO,
+            std::future::pending::<anyhow::Result<crate::pod::ExecStatus>>(),
+        )
+        .await;
+        let hung = step_outcome(hung, limit, at(120));
+        assert!(hung.timed_out && hung.exit.is_none());
+        assert_eq!(
+            hung.error.as_deref(),
+            Some("buildit: timed out waiting for the builder")
+        );
     }
 
     fn broker(workspace: Workspace) -> Arc<Broker> {
