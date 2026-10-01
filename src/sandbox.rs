@@ -20,11 +20,12 @@ pub struct SandboxName(String);
 
 impl SandboxName {
     pub fn parse(raw: &str) -> Result<Self> {
-        let ok = !raw.is_empty()
-            && raw.len() <= 128
-            && !raw.starts_with('-')
-            && raw
-                .bytes()
+        let bytes = raw.as_bytes();
+        let ok = raw.len() <= 63
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .iter()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
         if !ok {
             bail!("invalid sandbox name {raw:?}");
@@ -86,15 +87,9 @@ impl Workspace {
         matches!(self, Workspace::Openshell { .. })
     }
 
-    pub fn fetch_context(
-        &self,
-        sandbox: Option<&SandboxName>,
-        ctx: &RelPath,
-        dest: &Path,
-    ) -> Result<()> {
+    pub fn fetch_context(&self, name: &SandboxName, ctx: &RelPath, dest: &Path) -> Result<()> {
         match self {
             Workspace::Openshell { workdir } => {
-                let name = sandbox.ok_or_else(|| anyhow!("no sandbox name for this request"))?;
                 let path = format!("{}/{}", workdir.trim_end_matches('/'), ctx.as_str());
                 verified_sync(&mut || sandbox_tree_hash(name, &path), &mut || {
                     download(name, &path, dest)
@@ -111,14 +106,13 @@ impl Workspace {
         sanitize(dest)
     }
 
-    pub fn publish(&self, sandbox: Option<&SandboxName>, results: &Path) -> Result<()> {
+    pub fn publish(&self, name: &SandboxName, results: &Path) -> Result<()> {
         let id = results
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow!("results dir {} has no name", results.display()))?;
         match self {
             Workspace::Openshell { workdir } => {
-                let name = sandbox.ok_or_else(|| anyhow!("no sandbox name for this request"))?;
                 run(
                     &upload_argv(name, results, workdir),
                     "openshell sandbox upload",
@@ -507,6 +501,10 @@ mod tests {
         tree_hash_argv, upload_argv, verified_sync,
     };
 
+    fn local() -> SandboxName {
+        SandboxName::parse("local").unwrap()
+    }
+
     fn touch(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"x").unwrap();
@@ -575,6 +573,7 @@ mod tests {
     fn sandbox_names_cannot_smuggle_flags() {
         assert!(SandboxName::parse("ci-1234-abcdef").is_ok());
         assert!(SandboxName::parse("my_box.v2").is_ok());
+        assert!(SandboxName::parse(&"x".repeat(63)).is_ok());
         for bad in [
             "",
             "-n",
@@ -582,7 +581,10 @@ mod tests {
             "a b",
             "a;b",
             "a/b",
-            &"x".repeat(129),
+            "_a",
+            "a.",
+            ".a",
+            &"x".repeat(64),
         ] {
             assert!(SandboxName::parse(bad).is_err(), "{bad:?}");
         }
@@ -830,7 +832,7 @@ mod tests {
         };
         let out = tempfile::tempdir().unwrap();
         let dest = out.path().join("ctx");
-        ws.fetch_context(None, &RelPath::parse("svc").unwrap(), &dest)
+        ws.fetch_context(&local(), &RelPath::parse("svc").unwrap(), &dest)
             .unwrap();
         assert_eq!(
             tree(&dest),
@@ -858,7 +860,11 @@ mod tests {
             ("file", "not a directory"),
         ] {
             let err = ws
-                .fetch_context(None, &RelPath::parse(ctx).unwrap(), &out.path().join("a"))
+                .fetch_context(
+                    &local(),
+                    &RelPath::parse(ctx).unwrap(),
+                    &out.path().join("a"),
+                )
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(want), "{ctx}: {err}");
@@ -896,7 +902,7 @@ mod tests {
         };
         let out = tempfile::tempdir().unwrap();
         let dest = out.path().join("ctx");
-        ws.fetch_context(None, &RelPath::parse("svc").unwrap(), &dest)
+        ws.fetch_context(&local(), &RelPath::parse("svc").unwrap(), &dest)
             .unwrap();
         assert_eq!(
             links(&dest),
@@ -946,19 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn openshell_fetch_needs_a_sandbox_name() {
-        let ws = Workspace::Openshell {
-            workdir: "/sandbox/repo".to_string(),
-        };
-        let out = tempfile::tempdir().unwrap();
-        let err = ws
-            .fetch_context(None, &RelPath::parse("svc").unwrap(), out.path())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no sandbox name"), "{err}");
-    }
-
-    #[test]
     fn local_publish_merges_into_the_results_dir() {
         let work = tempfile::tempdir().unwrap();
         let ws = Workspace::Local {
@@ -967,11 +960,11 @@ mod tests {
         let stage = tempfile::tempdir().unwrap();
         let results = stage.path().join("buildit-0001");
         touch(&results.join("build.log"));
-        ws.publish(None, &results).unwrap();
+        ws.publish(&local(), &results).unwrap();
         fs::remove_dir_all(&results).unwrap();
         touch(&results.join("run.log"));
         touch(&results.join("out/bin/app"));
-        ws.publish(None, &results).unwrap();
+        ws.publish(&local(), &results).unwrap();
         assert_eq!(
             tree(&work.path().join(".buildit/buildit-0001")),
             BTreeSet::from([
@@ -1001,7 +994,7 @@ mod tests {
             let ws = Workspace::Local {
                 dir: work.path().to_path_buf(),
             };
-            let err = ws.publish(None, &results).unwrap_err().to_string();
+            let err = ws.publish(&local(), &results).unwrap_err().to_string();
             assert!(err.contains("symlinks are refused"), "{at}: {err}");
             assert_eq!(
                 fs::read_dir(elsewhere.path()).unwrap().count(),
@@ -1029,13 +1022,13 @@ mod tests {
         let ws = Workspace::Local {
             dir: work.path().to_path_buf(),
         };
-        let err = ws.publish(None, &results).unwrap_err().to_string();
+        let err = ws.publish(&local(), &results).unwrap_err().to_string();
         assert!(err.contains("symlinks are refused"), "{err}");
         assert_eq!(fs::read(&victim).unwrap(), b"original");
 
         fs::remove_file(dest.join("build.log")).unwrap();
         fs::hard_link(&victim, dest.join("build.log")).unwrap();
-        ws.publish(None, &results).unwrap();
+        ws.publish(&local(), &results).unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"original");
         assert_eq!(fs::read(dest.join("build.log")).unwrap(), b"log");
         assert_eq!(
@@ -1054,7 +1047,7 @@ mod tests {
         let ws = Workspace::Local {
             dir: work.path().to_path_buf(),
         };
-        let err = ws.publish(None, &results).unwrap_err().to_string();
+        let err = ws.publish(&local(), &results).unwrap_err().to_string();
         assert!(err.contains("symlinks are refused"), "{err}");
     }
 }

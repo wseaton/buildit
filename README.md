@@ -128,27 +128,44 @@ and content-addressed; prune with your registry's lifecycle policy.
 
 ## MCP server
 
-`buildit mcp` serves `build`, `run`, and `clean` as MCP tools over
+`buildit mcp` serves `build`, `run`, `logs`, and `clean` as MCP tools over
 streamable http, for an agent in a sandbox that can't build images itself
 (it runs as a crucible `[agent.broker]` on the loop pod).
 
 - `build` pulls a workspace subdirectory out of the sandbox
   (`openshell sandbox download`), builds it without pushing, and keeps the
-  builder pod alive. The full log lands at `.buildit/<build_id>/build.log`.
+  builder pod. The reply carries the log's line count, its last 40 lines and,
+  on failure, the first lines matching `error|fatal|undefined|cannot|failed`.
 - `run` starts a fresh container of a built image (buildah backend), runs a
   command, and copies `fetch_paths` back to `.buildit/<build_id>/<path>`.
-  Only regular files and directories come back.
+  Only regular files and directories come back. Each run gets its own log,
+  `run:<n>`.
+- `logs` reads part of a log (`build`, `run:<n>`, or `latest`): a line range,
+  a regex with context, head or tail, capped at `max_bytes`. Lines come back
+  numbered, grep style.
 - `clean` deletes builder pods.
 
+The server is stateless: no MCP sessions, every POST is answered with plain
+JSON, and nothing about a build lives in server memory. Builder pods carry
+`buildit.dev/managed-by=mcp`, `buildit.dev/build-id`, `buildit.dev/sandbox`,
+and `buildit.dev/state` labels, and every lookup goes through them, so a
+restarted server or a second replica keeps serving existing builds. Logs are
+appended inside the pod under `/buildit/logs` by the commands themselves;
+copies land at `.buildit/<build_id>/build.log` and `run-<n>.log`. A sandbox
+may hold `--max-builds` live builder pods (default 4); past that `build` is
+refused until `clean`. Builder pods are not deleted on shutdown: they go with
+the serving pod (ownerReference), at `--pod-deadline`, or on `clean`.
+
 Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
-`X-Crucible-Sandbox` header naming the sandbox. `Host` must be loopback,
-`host.openshell.internal`, `host.containers.internal`, or listed in
-`BROKER_ALLOWED_HOSTS`. The context must be a subdirectory not reached through
-a symlink. Symlinks inside it ship as links when they resolve inside the
-context and are dropped otherwise. `.git`, `.mcp.json`, `.claude`, `.buildit`,
-`.kube`, `.jira` are never shipped, and results are never written through a
-symlink under `.buildit`. Builder pods get no service account token, no service links,
-an `activeDeadlineSeconds`, and an ownerReference to the serving pod.
+`X-Crucible-Sandbox` header naming the sandbox; a build is only visible to the
+sandbox that made it. `Host` must be loopback, `host.openshell.internal`,
+`host.containers.internal`, or listed in `BROKER_ALLOWED_HOSTS`. The context
+must be a subdirectory not reached through a symlink. Symlinks inside it ship
+as links when they resolve inside the context and are dropped otherwise.
+`.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube`, `.jira` are never
+shipped, and results are never written through a symlink under `.buildit`.
+Builder pods get no service account token, no service links, an
+`activeDeadlineSeconds`, and an ownerReference to the serving pod.
 
 ```sh
 # in-cluster (namespace from the service account)
@@ -156,6 +173,8 @@ BROKER_TOKEN=... BROKER_SANDBOX_WORKDIR=/sandbox/repo buildit mcp
 # off-cluster dev: a local dir stands in for the sandbox
 BROKER_TOKEN=dev buildit mcp --local-workdir . --kubecontext kind-dev -n default \
   --bind 127.0.0.1:8849
+# end-to-end tests against a disposable cluster
+BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored
 ```
 
 ## How it compares

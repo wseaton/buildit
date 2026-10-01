@@ -1,6 +1,7 @@
 mod auth;
 mod backend;
 mod build;
+mod buildlog;
 mod context;
 mod job;
 mod mcp;
@@ -42,8 +43,8 @@ enum Cmd {
         #[arg(long)]
         kubecontext: Option<String>,
     },
-    /// Serve build/run/clean as MCP tools over streamable http (a crucible
-    /// [agent.broker]); needs BROKER_TOKEN
+    /// Serve build/run/logs/clean as stateless MCP tools over streamable
+    /// http (a crucible [agent.broker]); needs BROKER_TOKEN
     Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {

@@ -61,6 +61,7 @@ pub async fn run(client: kube::Client, args: &BuildArgs, sink: &mut LogSink) -> 
         node: args.node.as_deref(),
         deadline_secs: POD_DEADLINE_SECS,
         owner: None,
+        meta: None,
     };
     let pod = BuilderPod::create(client, &args.namespace, args.backend, &opts).await?;
     tracing::info!("builder pod {} created, waiting for ready", pod.name);
@@ -145,6 +146,7 @@ pub fn render(args: &BuildArgs) -> Result<String> {
                 node: args.node.as_deref(),
                 deadline_secs: POD_DEADLINE_SECS,
                 owner: None,
+                meta: None,
             };
             let pod = args.backend.pod_spec(&name, &args.namespace, &opts)?;
             Ok(serde_norway::to_string(&pod)?)

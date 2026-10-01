@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Request, State};
@@ -14,19 +14,24 @@ use clap::Args;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Api;
+use kube::api::{DeleteParams, ListParams};
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
-use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{Backend, PodOpts, Resources};
+use crate::backend::{BACKEND_LABEL, Backend, PodMeta, PodOpts, Resources};
 use crate::build::POD_READY_TIMEOUT;
-use crate::pod::{BuilderPod, ExecStatus, LogSink};
+use crate::buildlog::{
+    LOG_DIR, LogName, LogPage, LogQuery, LogSelector, LogSummary, LogText, QueryParams, READ_LIMIT,
+    alloc_run_argv, list_argv, note_argv, parse_list, parse_run_number, read_argv, step_argv,
+    summarize,
+};
+use crate::pod::{BuilderPod, ExecStatus};
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxName, Workspace};
 
 pub const MCP_PATH: &str = "/mcp";
@@ -34,13 +39,24 @@ pub const SANDBOX_HEADER: &str = "x-crucible-sandbox";
 
 const SANDBOX_HOSTS: [&str; 2] = ["host.containers.internal", "host.openshell.internal"];
 
+// the caller identity when a local-dir server gets no sandbox header
+const LOCAL_CALLER: &str = "local";
+
+const LABEL_MANAGED_BY: &str = "buildit.dev/managed-by";
+const MANAGED_BY: &str = "mcp";
+const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
+const LABEL_SANDBOX: &str = "buildit.dev/sandbox";
+const LABEL_STATE: &str = "buildit.dev/state";
+const ANNOTATION_CONTEXT: &str = "buildit.dev/context";
+const ANNOTATION_DOCKERFILE: &str = "buildit.dev/dockerfile";
+const ANNOTATION_TARGET: &str = "buildit.dev/target";
+
 const DEFAULT_BUILD_TIMEOUT_S: u64 = 1800;
 const DEFAULT_RUN_TIMEOUT_S: u64 = 600;
-const LOG_TAIL_LINES: usize = 60;
-const LOG_TAIL_BYTES: usize = 8 * 1024;
+const FROM_TIMEOUT_S: u64 = 300;
+const EXEC_SLACK: Duration = Duration::from_secs(60);
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-const CLEAN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -64,9 +80,9 @@ pub struct McpArgs {
     /// Builder pod lifetime (activeDeadlineSeconds)
     #[arg(long, default_value_t = 7200)]
     pub pod_deadline: i64,
-    /// Live builder pods kept for `run`; the oldest is deleted past this
+    /// Live builder pods per sandbox; `build` is refused past this
     #[arg(long, default_value_t = 4)]
-    pub max_sessions: usize,
+    pub max_builds: usize,
     /// Resource requests for builder pods, repeatable: --request cpu=2
     #[arg(long = "request", value_name = "KEY=QTY", value_parser = crate::parse_kv)]
     pub requests: Vec<(String, String)>,
@@ -108,10 +124,8 @@ pub async fn serve(args: McpArgs) -> Result<()> {
             limits: args.limits,
         },
         deadline_secs: args.pod_deadline,
-        max_sessions: args.max_sessions.max(1),
+        max_builds: args.max_builds.max(1),
         owner,
-        sessions: Mutex::new(Vec::new()),
-        runs: AtomicU64::new(0),
     });
 
     let listener = tokio::net::TcpListener::bind(&args.bind)
@@ -124,7 +138,7 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         broker.backend
     );
     let hosts = allowed_hosts(env_hosts().as_deref());
-    let deleted = serve_until(
+    serve_until(
         listener,
         broker,
         token,
@@ -132,9 +146,7 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         shutdown_signal()?,
         SHUTDOWN_GRACE,
     )
-    .await?;
-    tracing::info!("deleted {} builder pod(s) on shutdown", deleted.len());
-    Ok(())
+    .await
 }
 
 async fn serve_until(
@@ -144,9 +156,9 @@ async fn serve_until(
     hosts: Vec<String>,
     shutdown: impl Future<Output = ()>,
     grace: Duration,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     let ct = CancellationToken::new();
-    let app = router(broker.clone(), token, hosts, ct.clone());
+    let app = router(broker, token, hosts, ct.clone());
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(ct.clone().cancelled_owned())
         .into_future();
@@ -154,7 +166,7 @@ async fn serve_until(
     let served = tokio::select! {
         result = &mut server => result,
         () = shutdown => {
-            tracing::info!("shutting down; closing open streams");
+            tracing::info!("shutting down; cancelling in-flight calls");
             ct.cancel();
             match tokio::time::timeout(grace, &mut server).await {
                 Ok(result) => result,
@@ -165,15 +177,7 @@ async fn serve_until(
             }
         }
     };
-    let deleted = match tokio::time::timeout(CLEAN_TIMEOUT, broker.clean(None, None)).await {
-        Ok(deleted) => deleted,
-        Err(_) => {
-            tracing::warn!("deleting builder pods timed out after {CLEAN_TIMEOUT:?}");
-            Vec::new()
-        }
-    };
-    served.context("serving buildit mcp")?;
-    Ok(deleted)
+    served.context("serving buildit mcp")
 }
 
 pub fn router(
@@ -183,12 +187,16 @@ pub fn router(
     ct: CancellationToken,
 ) -> axum::Router {
     let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_sse_retry(None)
         .with_allowed_hosts(hosts)
         .with_cancellation_token(ct);
-    let service: StreamableHttpService<BuilditMcp, LocalSessionManager> =
+    let service: StreamableHttpService<BuilditMcp, NeverSessionManager> =
         StreamableHttpService::new(
             move || Ok(BuilditMcp::new(broker.clone())),
-            Default::default(),
+            Arc::new(NeverSessionManager::default()),
             config,
         );
     axum::Router::new()
@@ -301,20 +309,135 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-struct Session {
-    id: String,
-    pod: BuilderPod,
-    sandbox: Option<SandboxName>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildId(String);
+
+impl BuildId {
+    fn fresh() -> Self {
+        Self(crate::pod::unique_name())
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        let bytes = raw.as_bytes();
+        let ok = raw.len() <= 63
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !ok {
+            bail!("invalid build_id {raw:?}");
+        }
+        Ok(Self(raw.to_string()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn tag(&self) -> String {
+        local_tag(&self.0)
+    }
 }
 
-impl Session {
-    fn tag(&self) -> String {
-        local_tag(&self.id)
+impl fmt::Display for BuildId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
 fn local_tag(id: &str) -> String {
     format!("localhost/buildit/{id}:latest")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildState {
+    Building,
+    Built,
+    Failed,
+}
+
+impl BuildState {
+    fn label(self) -> &'static str {
+        match self {
+            BuildState::Building => "building",
+            BuildState::Built => "built",
+            BuildState::Failed => "failed",
+        }
+    }
+
+    fn from_label(raw: &str) -> Option<Self> {
+        [BuildState::Building, BuildState::Built, BuildState::Failed]
+            .into_iter()
+            .find(|s| s.label() == raw)
+    }
+}
+
+fn label<'a>(pod: &'a Pod, key: &str) -> Option<&'a str> {
+    pod.metadata.labels.as_ref()?.get(key).map(String::as_str)
+}
+
+fn selector(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn owned_by(pod: &Pod, caller: &SandboxName) -> bool {
+    label(pod, LABEL_MANAGED_BY) == Some(MANAGED_BY)
+        && label(pod, LABEL_SANDBOX) == Some(caller.as_str())
+}
+
+fn alive(pod: &Pod) -> bool {
+    pod.metadata.deletion_timestamp.is_none()
+        && !matches!(
+            pod.status.as_ref().and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
+        )
+}
+
+fn pod_name(pod: &Pod) -> &str {
+    pod.metadata.name.as_deref().unwrap_or_default()
+}
+
+// oldest first, ties by name
+fn within_cap(live: &[Pod], cap: usize, id: &BuildId) -> bool {
+    let mut ranked: Vec<&Pod> = live.iter().collect();
+    ranked.sort_by(|a, b| {
+        let at = a.metadata.creation_timestamp.as_ref().map(|t| t.0);
+        let bt = b.metadata.creation_timestamp.as_ref().map(|t| t.0);
+        at.cmp(&bt).then_with(|| pod_name(a).cmp(pod_name(b)))
+    });
+    ranked
+        .iter()
+        .position(|p| label(p, LABEL_BUILD_ID) == Some(id.as_str()))
+        .is_some_and(|i| i < cap)
+}
+
+fn pod_labels(caller: &SandboxName, id: &BuildId) -> Vec<(String, String)> {
+    [
+        (LABEL_MANAGED_BY, MANAGED_BY),
+        (LABEL_SANDBOX, caller.as_str()),
+        (LABEL_BUILD_ID, id.as_str()),
+        (LABEL_STATE, BuildState::Building.label()),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .to_vec()
+}
+
+struct LiveBuild {
+    id: BuildId,
+    pod: BuilderPod,
+    backend: Backend,
+    state: Option<BuildState>,
+}
+
+impl LiveBuild {
+    fn runnable(&self) -> bool {
+        self.state == Some(BuildState::Built) && self.backend == Backend::Buildah
+    }
 }
 
 pub struct Broker {
@@ -324,11 +447,8 @@ pub struct Broker {
     backend: Backend,
     resources: Resources,
     deadline_secs: i64,
-    max_sessions: usize,
+    max_builds: usize,
     owner: Option<OwnerReference>,
-    // oldest first
-    sessions: Mutex<Vec<Arc<Session>>>,
-    runs: AtomicU64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -364,6 +484,36 @@ pub struct RunParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LogsParams {
+    /// build_id from build
+    pub build_id: String,
+    /// "build", "run:<n>", or "latest" (default: the newest run, else the build)
+    #[serde(default)]
+    pub which: Option<String>,
+    /// Only the last N selected lines
+    #[serde(default)]
+    pub tail_lines: Option<u64>,
+    /// Only the first N selected lines
+    #[serde(default)]
+    pub head_lines: Option<u64>,
+    /// First line number to consider (1-based, inclusive)
+    #[serde(default)]
+    pub from_line: Option<u64>,
+    /// Last line number to consider (inclusive)
+    #[serde(default)]
+    pub to_line: Option<u64>,
+    /// Regex (Rust syntax; prefix (?i) to ignore case); keeps matching lines
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// Lines of context around each grep match (max 20)
+    #[serde(default)]
+    pub context_lines: Option<u64>,
+    /// Output cap in bytes (default 16384, 2048..=65536)
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CleanParams {
     /// Build to delete; omit to delete every build of this sandbox
     #[serde(default)]
@@ -376,16 +526,14 @@ pub struct BuildReply {
     pub exit: Option<i32>,
     pub timed_out: bool,
     pub runnable: bool,
-    pub log: String,
-    pub log_tail: String,
+    pub log: LogSummary,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct RunReply {
     pub exit: Option<i32>,
     pub timed_out: bool,
-    pub log: String,
-    pub log_tail: String,
+    pub log: LogSummary,
     pub fetched: Vec<String>,
     pub missing: Vec<String>,
     pub skipped: Vec<String>,
@@ -432,6 +580,23 @@ impl BuildRequest {
             timeout: timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S),
         })
     }
+
+    fn annotations(&self) -> Vec<(String, String)> {
+        let mut out = vec![
+            (
+                ANNOTATION_CONTEXT.to_string(),
+                self.context.as_str().to_string(),
+            ),
+            (
+                ANNOTATION_DOCKERFILE.to_string(),
+                self.dockerfile.as_str().to_string(),
+            ),
+        ];
+        if let Some(t) = &self.target {
+            out.push((ANNOTATION_TARGET.to_string(), t.clone()));
+        }
+        out
+    }
 }
 
 fn timeout(requested: Option<u64>, default: u64) -> Duration {
@@ -444,19 +609,8 @@ fn from_argv(tag: &str, ctr: &str) -> Vec<String> {
         .to_vec()
 }
 
-fn run_argv(ctr: &str, cmd: &[String], timeout: Duration) -> Vec<String> {
-    let mut argv = [
-        "timeout",
-        "-k",
-        "10",
-        &timeout.as_secs().to_string(),
-        "buildah",
-        "run",
-        ctr,
-        "--",
-    ]
-    .map(String::from)
-    .to_vec();
+fn run_argv(ctr: &str, cmd: &[String]) -> Vec<String> {
+    let mut argv = ["buildah", "run", ctr, "--"].map(String::from).to_vec();
     argv.extend(cmd.iter().cloned());
     argv
 }
@@ -529,71 +683,199 @@ fn unpack_fetched(tar: &[u8], dest: &Path, requested: &[RelPath]) -> Result<Fetc
     Ok(out)
 }
 
-fn tail(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(LOG_TAIL_LINES);
-    let joined = lines[start..].join("\n");
-    if joined.len() <= LOG_TAIL_BYTES {
-        return joined;
-    }
-    let mut cut = joined.len() - LOG_TAIL_BYTES;
-    while !joined.is_char_boundary(cut) {
-        cut += 1;
-    }
-    joined[cut..].to_string()
-}
-
-fn read_tail(path: &Path) -> String {
-    std::fs::read(path)
-        .map(|b| tail(&String::from_utf8_lossy(&b)))
-        .unwrap_or_default()
-}
-
-fn results_path(id: &str, file: &str) -> String {
+fn results_path(id: &BuildId, file: &str) -> String {
     format!("{RESULTS_DIR}/{id}/{file}")
 }
 
+// exit code and timeout flag from a step run under `timeout`
+fn step_outcome(status: Result<Result<ExecStatus>, tokio::time::error::Elapsed>) -> StepOutcome {
+    match status {
+        Ok(Ok(s)) => StepOutcome {
+            exit: s.code,
+            timed_out: s.code == Some(124),
+            error: None,
+        },
+        Ok(Err(e)) => StepOutcome {
+            exit: None,
+            timed_out: false,
+            error: Some(format!("buildit: {e:#}")),
+        },
+        Err(_) => StepOutcome {
+            exit: None,
+            timed_out: true,
+            error: Some("buildit: timed out waiting for the builder".to_string()),
+        },
+    }
+}
+
+struct StepOutcome {
+    exit: Option<i32>,
+    timed_out: bool,
+    error: Option<String>,
+}
+
+impl StepOutcome {
+    fn success(&self) -> bool {
+        self.exit == Some(0)
+    }
+}
+
 impl Broker {
-    fn sandbox_for(&self, parts: &Parts) -> Result<Option<SandboxName>> {
+    fn caller(&self, parts: &Parts) -> Result<SandboxName> {
         let raw = parts
             .headers
             .get(SANDBOX_HEADER)
             .map(|v| v.to_str().context("sandbox header is not ascii"))
             .transpose()?;
         match (raw, self.workspace.needs_sandbox()) {
-            (Some(raw), _) => Ok(Some(SandboxName::parse(raw)?)),
+            (Some(raw), _) => SandboxName::parse(raw),
             (None, true) => bail!("request carries no {SANDBOX_HEADER} header; refusing"),
-            (None, false) => Ok(None),
+            (None, false) => SandboxName::parse(LOCAL_CALLER),
         }
     }
 
-    async fn publish(&self, sandbox: Option<SandboxName>, results: PathBuf) -> Result<()> {
-        let ws = &self.workspace;
-        tokio::task::block_in_place(|| ws.publish(sandbox.as_ref(), &results))
+    fn pods(&self) -> Api<Pod> {
+        Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    pub async fn build(
+    async fn list(&self, pairs: &[(&str, &str)]) -> Result<Vec<Pod>> {
+        let sel = selector(pairs);
+        Ok(self
+            .pods()
+            .list(&ListParams::default().labels(&sel))
+            .await
+            .with_context(|| format!("listing builder pods ({sel})"))?
+            .items)
+    }
+
+    async fn live_builds(&self, caller: &SandboxName) -> Result<Vec<Pod>> {
+        let pods = self
+            .list(&[
+                (LABEL_MANAGED_BY, MANAGED_BY),
+                (LABEL_SANDBOX, caller.as_str()),
+            ])
+            .await?;
+        Ok(pods
+            .into_iter()
+            .filter(|p| alive(p) && owned_by(p, caller))
+            .collect())
+    }
+
+    async fn check_cap(&self, caller: &SandboxName, me: Option<&BuildId>) -> Result<()> {
+        let live = self.live_builds(caller).await?;
+        let ok = match me {
+            None => live.len() < self.max_builds,
+            Some(id) => within_cap(&live, self.max_builds, id),
+        };
+        if ok {
+            return Ok(());
+        }
+        let ids: Vec<&str> = live
+            .iter()
+            .filter_map(|p| label(p, LABEL_BUILD_ID))
+            .filter(|id| me.is_none_or(|me| me.as_str() != *id))
+            .collect();
+        bail!(
+            "this sandbox has {} live builds (max {}): {}; clean one first",
+            ids.len(),
+            self.max_builds,
+            ids.join(", ")
+        )
+    }
+
+    // pods of other sandboxes look exactly like missing ones
+    async fn find(&self, caller: &SandboxName, id: &BuildId) -> Result<LiveBuild> {
+        let gone = || anyhow!("no live build {id:?}; build again");
+        let pods = self
+            .list(&[
+                (LABEL_MANAGED_BY, MANAGED_BY),
+                (LABEL_BUILD_ID, id.as_str()),
+            ])
+            .await?;
+        let pod = pods
+            .into_iter()
+            .find(|p| owned_by(p, caller) && p.metadata.deletion_timestamp.is_none())
+            .ok_or_else(gone)?;
+        if !alive(&pod) {
+            bail!("build {id} expired (builder pod deadline); build again");
+        }
+        let backend = label(&pod, BACKEND_LABEL)
+            .and_then(Backend::from_label)
+            .ok_or_else(gone)?;
+        Ok(LiveBuild {
+            id: id.clone(),
+            pod: BuilderPod::existing(self.client.clone(), &self.namespace, pod_name(&pod)),
+            backend,
+            state: label(&pod, LABEL_STATE).and_then(BuildState::from_label),
+        })
+    }
+
+    async fn publish(&self, caller: &SandboxName, results: &Path) -> Result<()> {
+        let ws = &self.workspace;
+        tokio::task::block_in_place(|| ws.publish(caller, results))
+    }
+
+    async fn note(&self, pod: &BuilderPod, backend: Backend, log: LogName, line: &str) {
+        if let Err(e) = pod
+            .exec_capture(&note_argv(backend.shell(), log, line))
+            .await
+        {
+            tracing::warn!("writing to {log} log in {}: {e:#}", pod.name);
+        }
+    }
+
+    async fn read_log(&self, pod: &BuilderPod, backend: Backend, log: LogName) -> Result<LogText> {
+        let out = pod
+            .exec_capture_bytes(&read_argv(backend.shell(), log), READ_LIMIT + 64)
+            .await
+            .with_context(|| format!("reading the {log} log"))?;
+        LogText::parse(out)
+    }
+
+    // pulls the pod's log into results/<file> and summarizes it
+    async fn collect_log(
         &self,
-        sandbox: Option<SandboxName>,
-        params: BuildParams,
-    ) -> Result<BuildReply> {
+        pod: &BuilderPod,
+        backend: Backend,
+        log: LogName,
+        id: &BuildId,
+        results: &Path,
+        failed: bool,
+    ) -> Result<LogSummary> {
+        let text = match self.read_log(pod, backend, log).await {
+            Ok(text) => text,
+            Err(e) => LogText::whole(format!("buildit: {e:#}\n").into_bytes()),
+        };
+        let file = log.file_name();
+        std::fs::write(results.join(&file), text.body())
+            .with_context(|| format!("writing {file}"))?;
+        summarize(&text, log, results_path(id, &file), failed)
+    }
+
+    pub async fn build(&self, caller: &SandboxName, params: BuildParams) -> Result<BuildReply> {
         let req = BuildRequest::parse(params)?;
-        let id = crate::pod::unique_name();
+        self.check_cap(caller, None).await?;
+        let id = BuildId::fresh();
         let stage = tempfile::tempdir().context("creating staging dir")?;
         let ctx_dir = stage.path().join("ctx");
-        let results = stage.path().join(&id);
+        let results = stage.path().join(id.as_str());
         std::fs::create_dir_all(&results).context("creating results dir")?;
-        let log_path = results.join("build.log");
 
         let ws = &self.workspace;
-        tokio::task::block_in_place(|| ws.fetch_context(sandbox.as_ref(), &req.context, &ctx_dir))?;
+        tokio::task::block_in_place(|| ws.fetch_context(caller, &req.context, &ctx_dir))?;
         let tarball = crate::context::tarball(&ctx_dir)?;
         tracing::info!(
-            "build {id}: context {} ({} KiB)",
+            "build {id}: sandbox {} context {} ({} KiB)",
+            caller.as_str(),
             req.context.as_str(),
             tarball.len() / 1024
         );
 
+        let meta = PodMeta {
+            labels: pod_labels(caller, &id),
+            annotations: req.annotations(),
+            log_dir: Some(LOG_DIR.to_string()),
+        };
         let opts = PodOpts {
             idle_nodes: &[],
             resources: &self.resources,
@@ -601,200 +883,240 @@ impl Broker {
             node: None,
             deadline_secs: self.deadline_secs,
             owner: self.owner.as_ref(),
+            meta: Some(&meta),
         };
         let pod = BuilderPod::create_named(
             self.client.clone(),
             &self.namespace,
             self.backend,
-            &id,
+            id.as_str(),
             &opts,
         )
         .await?;
-        let mut sink = LogSink::file(&log_path)?;
-        let steps = self.backend.local_build_steps(
-            &local_tag(&id),
+        let ready = async {
+            self.check_cap(caller, Some(&id)).await?;
+            pod.wait_ready(POD_READY_TIMEOUT).await
+        };
+        if let Err(e) = ready.await {
+            if let Err(del) = pod.delete().await {
+                tracing::warn!("deleting builder pod {id}: {del:#}");
+            }
+            return Err(e);
+        }
+
+        let outcome = step_outcome(
+            tokio::time::timeout(
+                req.timeout + EXEC_SLACK,
+                self.drive_build(&pod, &req, &tarball),
+            )
+            .await,
+        );
+        if let Some(line) = &outcome.error {
+            self.note(&pod, self.backend, LogName::Build, line).await;
+        }
+        let state = if outcome.success() {
+            BuildState::Built
+        } else {
+            BuildState::Failed
+        };
+        let labelled = pod.set_labels(&[(LABEL_STATE, state.label())]).await;
+        if let Err(e) = &labelled {
+            tracing::warn!("build {id}: {e:#}");
+        }
+        let log = self
+            .collect_log(
+                &pod,
+                self.backend,
+                LogName::Build,
+                &id,
+                &results,
+                !outcome.success(),
+            )
+            .await?;
+        self.publish(caller, &results).await?;
+        Ok(BuildReply {
+            runnable: outcome.success() && labelled.is_ok() && self.backend == Backend::Buildah,
+            build_id: id.to_string(),
+            exit: outcome.exit,
+            timed_out: outcome.timed_out,
+            log,
+        })
+    }
+
+    async fn drive_build(
+        &self,
+        pod: &BuilderPod,
+        req: &BuildRequest,
+        tarball: &[u8],
+    ) -> Result<ExecStatus> {
+        let backend = self.backend;
+        let started = Instant::now();
+        pod.exec_capture(&backend.setup_command()).await?;
+        pod.exec_with_stdin(&backend.untar_command(), tarball)
+            .await?;
+        let steps = backend.local_build_steps(
+            &local_tag(pod.name.as_str()),
             req.dockerfile.as_str(),
             req.target.as_deref(),
             &req.build_args,
         );
-        let outcome = tokio::time::timeout(
-            req.timeout,
-            drive(&pod, self.backend, &tarball, &steps, &mut sink),
-        )
-        .await;
-        let (status, timed_out) = match outcome {
-            Ok(Ok(status)) => (Some(status), false),
-            Ok(Err(e)) => {
-                sink.line(&format!("buildit: {e:#}")).await.ok();
-                (None, false)
+        let mut last = None;
+        for step in &steps {
+            let left = req.timeout.saturating_sub(started.elapsed()).as_secs();
+            let status = pod
+                .exec_status(&step_argv(backend.shell(), LogName::Build, left, step))
+                .await?;
+            if !status.success() {
+                return Ok(status);
             }
-            Err(_) => {
-                sink.line(&format!("buildit: timed out after {:?}", req.timeout))
-                    .await
-                    .ok();
-                (None, true)
-            }
-        };
-        sink.flush().await.ok();
-        let success = status.as_ref().is_some_and(ExecStatus::success);
-        let runnable = success && self.backend == Backend::Buildah;
-        if runnable {
-            self.keep(Session {
-                id: id.clone(),
-                pod,
-                sandbox: sandbox.clone(),
-            })
-            .await;
-        } else if let Err(e) = pod.delete().await {
-            tracing::warn!("deleting builder pod {id}: {e:#}");
+            last = Some(status);
         }
-        let log_tail = read_tail(&log_path);
-        self.publish(sandbox, results).await?;
-        Ok(BuildReply {
-            log: results_path(&id, "build.log"),
-            build_id: id,
-            exit: status.and_then(|s| s.code),
-            timed_out,
-            runnable,
-            log_tail,
-        })
+        last.ok_or_else(|| anyhow!("backend produced no build steps"))
     }
 
-    async fn keep(&self, session: Session) {
-        let evicted = {
-            let mut live = self.sessions.lock().await;
-            live.push(Arc::new(session));
-            let excess = live.len().saturating_sub(self.max_sessions);
-            live.drain(..excess).collect::<Vec<_>>()
-        };
-        for old in evicted {
-            tracing::info!("evicting build {} (max {} live)", old.id, self.max_sessions);
-            if let Err(e) = old.pod.delete().await {
-                tracing::warn!("deleting builder pod {}: {e:#}", old.id);
-            }
-        }
-    }
-
-    async fn session(&self, sandbox: Option<&SandboxName>, id: &str) -> Result<Arc<Session>> {
-        self.sessions
-            .lock()
-            .await
-            .iter()
-            .find(|s| s.id == id && s.sandbox.as_ref() == sandbox)
-            .cloned()
-            .ok_or_else(|| anyhow!("no live build {id:?}; build again"))
-    }
-
-    pub async fn run(&self, sandbox: Option<SandboxName>, params: RunParams) -> Result<RunReply> {
+    pub async fn run(&self, caller: &SandboxName, params: RunParams) -> Result<RunReply> {
         if params.cmd.is_empty() {
             bail!("cmd must not be empty");
         }
+        let id = BuildId::parse(&params.build_id)?;
         let paths = params
             .fetch_paths
             .iter()
             .map(|p| RelPath::parse_container(p))
             .collect::<Result<Vec<_>>>()?;
-        let session = self.session(sandbox.as_ref(), &params.build_id).await?;
+        let build = self.find(caller, &id).await?;
+        if !build.runnable() {
+            bail!(
+                "build {id} is not runnable (state {}); see logs(which: \"build\")",
+                build.state.map_or("unknown", BuildState::label)
+            );
+        }
         let limit = timeout(params.timeout_s, DEFAULT_RUN_TIMEOUT_S);
         let stage = tempfile::tempdir().context("creating staging dir")?;
-        let results = stage.path().join(&session.id);
+        let results = stage.path().join(id.as_str());
         std::fs::create_dir_all(&results).context("creating results dir")?;
-        let log_path = results.join("run.log");
-        let mut sink = LogSink::file(&log_path)?;
 
-        let n = self.runs.fetch_add(1, Ordering::Relaxed);
-        let ctr = format!("{}-run{n}", session.id);
-        let pod = &session.pod;
-        pod.exec_capture(&from_argv(&session.tag(), &ctr)).await?;
-        let argv = run_argv(&ctr, &params.cmd, limit);
-        sink.line(&format!("$ {}", params.cmd.join(" "))).await?;
-        let status = tokio::time::timeout(
-            limit + Duration::from_secs(30),
-            pod.exec_logged(&argv, &mut sink),
-        )
-        .await;
-        let (exit, timed_out) = match status {
-            Ok(Ok(s)) => (s.code, s.code == Some(124)),
-            Ok(Err(e)) => {
-                sink.line(&format!("buildit: {e:#}")).await.ok();
-                (None, false)
-            }
-            Err(_) => (None, true),
-        };
-        sink.flush().await.ok();
-
-        let fetched = if paths.is_empty() {
-            Fetched::default()
+        let pod = &build.pod;
+        let shell = build.backend.shell();
+        let n = parse_run_number(&pod.exec_capture(&alloc_run_argv(shell)).await?)?;
+        let log = LogName::Run(n);
+        let ctr = format!("{id}-run{n}");
+        let from = step_outcome(
+            tokio::time::timeout(
+                Duration::from_secs(FROM_TIMEOUT_S) + EXEC_SLACK,
+                pod.exec_status(&step_argv(
+                    shell,
+                    log,
+                    FROM_TIMEOUT_S,
+                    &from_argv(&id.tag(), &ctr),
+                )),
+            )
+            .await,
+        );
+        let outcome = if from.success() {
+            step_outcome(
+                tokio::time::timeout(
+                    limit + EXEC_SLACK,
+                    pod.exec_status(&step_argv(
+                        shell,
+                        log,
+                        limit.as_secs(),
+                        &run_argv(&ctr, &params.cmd),
+                    )),
+                )
+                .await,
+            )
         } else {
-            let tar = pod
-                .exec_capture_bytes(&fetch_argv(&ctr, &paths), FETCH_LIMIT)
-                .await
-                .context("fetching paths from the container")?;
-            let dest = results.clone();
-            tokio::task::block_in_place(|| unpack_fetched(&tar, &dest, &paths))?
+            from
+        };
+        if let Some(line) = &outcome.error {
+            self.note(pod, build.backend, log, line).await;
+        }
+
+        let fetched = if paths.is_empty() || outcome.exit.is_none() {
+            Ok(Fetched::default())
+        } else {
+            self.fetch(pod, &ctr, &paths, &results).await
         };
         if let Err(e) = pod.exec_capture(&rm_argv(&ctr)).await {
             tracing::warn!("removing container {ctr}: {e:#}");
         }
-        let log_tail = read_tail(&log_path);
-        self.publish(sandbox, results).await?;
+        let fetched = fetched?;
+        let summary = self
+            .collect_log(pod, build.backend, log, &id, &results, !outcome.success())
+            .await?;
+        self.publish(caller, &results).await?;
         Ok(RunReply {
-            exit,
-            timed_out,
-            log: results_path(&session.id, "run.log"),
-            log_tail,
+            exit: outcome.exit,
+            timed_out: outcome.timed_out,
+            log: summary,
             fetched: fetched
                 .files
                 .iter()
-                .map(|f| results_path(&session.id, f))
+                .map(|f| results_path(&build.id, f))
                 .collect(),
             missing: fetched.missing,
             skipped: fetched.skipped,
         })
     }
 
-    pub async fn clean(&self, sandbox: Option<&SandboxName>, id: Option<&str>) -> Vec<String> {
-        let doomed = {
-            let mut live = self.sessions.lock().await;
-            let (doomed, keep): (Vec<_>, Vec<_>) = live.drain(..).partition(|s| match id {
-                Some(id) => s.id == id && s.sandbox.as_ref() == sandbox,
-                None => sandbox.is_none() || s.sandbox.as_ref() == sandbox,
-            });
-            *live = keep;
-            doomed
-        };
+    async fn fetch(
+        &self,
+        pod: &BuilderPod,
+        ctr: &str,
+        paths: &[RelPath],
+        results: &Path,
+    ) -> Result<Fetched> {
+        let tar = pod
+            .exec_capture_bytes(&fetch_argv(ctr, paths), FETCH_LIMIT)
+            .await
+            .context("fetching paths from the container")?;
+        tokio::task::block_in_place(|| unpack_fetched(&tar, results, paths))
+    }
+
+    pub async fn logs(&self, caller: &SandboxName, p: LogsParams) -> Result<LogPage> {
+        let id = BuildId::parse(&p.build_id)?;
+        let which = LogSelector::parse(p.which.as_deref().unwrap_or("latest"))?;
+        let query = LogQuery::new(QueryParams {
+            from_line: p.from_line,
+            to_line: p.to_line,
+            head_lines: p.head_lines,
+            tail_lines: p.tail_lines,
+            grep: p.grep.as_deref(),
+            context_lines: p.context_lines,
+            max_bytes: p.max_bytes,
+        })?;
+        let build = self.find(caller, &id).await?;
+        let shell = build.backend.shell();
+        let available = parse_list(&build.pod.exec_capture(&list_argv(shell)).await?);
+        let log = which.resolve(&available)?;
+        let text = self.read_log(&build.pod, build.backend, log).await?;
+        Ok(query.run(&text, log, &available))
+    }
+
+    pub async fn clean(&self, caller: &SandboxName, id: Option<&str>) -> Result<Vec<String>> {
+        let id = id.map(BuildId::parse).transpose()?;
+        let mut pairs = vec![
+            (LABEL_MANAGED_BY, MANAGED_BY),
+            (LABEL_SANDBOX, caller.as_str()),
+        ];
+        if let Some(id) = &id {
+            pairs.push((LABEL_BUILD_ID, id.as_str()));
+        }
         let mut deleted = Vec::new();
-        for s in doomed {
-            match s.pod.delete().await {
-                Ok(()) => deleted.push(s.id.clone()),
-                Err(e) => tracing::warn!("deleting builder pod {}: {e:#}", s.id),
+        for pod in self.list(&pairs).await? {
+            if !owned_by(&pod, caller) || pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            let name = pod_name(&pod);
+            match self.pods().delete(name, &DeleteParams::default()).await {
+                Ok(_) => deleted.push(label(&pod, LABEL_BUILD_ID).unwrap_or(name).to_string()),
+                Err(e) => tracing::warn!("deleting builder pod {name}: {e:#}"),
             }
         }
-        deleted
+        deleted.sort();
+        Ok(deleted)
     }
-}
-
-async fn drive(
-    pod: &BuilderPod,
-    backend: Backend,
-    tarball: &[u8],
-    steps: &[Vec<String>],
-    sink: &mut LogSink,
-) -> Result<ExecStatus> {
-    pod.wait_ready(POD_READY_TIMEOUT).await?;
-    pod.exec_stream(&backend.setup_command(), sink).await?;
-    pod.exec_with_stdin(&backend.untar_command(), tarball)
-        .await?;
-    let mut last = None;
-    for step in steps {
-        sink.line(&format!("$ {}", step.join(" "))).await?;
-        let status = pod.exec_logged(step, sink).await?;
-        if !status.success() {
-            return Ok(status);
-        }
-        last = Some(status);
-    }
-    last.ok_or_else(|| anyhow!("backend produced no build steps"))
 }
 
 #[derive(Clone)]
@@ -815,9 +1137,10 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Build a Dockerfile from a workspace subdirectory on a remote builder. \
-        Pushes nothing. Returns build_id, exit, and the log tail; the full log is at \
-        .buildit/<build_id>/build.log. A runnable build keeps its builder alive for `run`."
+        description = "Build a Dockerfile from a workspace subdirectory on a remote builder; pushes \
+        nothing. Returns build_id, exit, runnable, and log: total_lines, the last 40 lines and, on \
+        failure, the first error-looking lines (`N:text`). Query more with `logs`; a copy lands at \
+        .buildit/<build_id>/build.log. The builder stays up for `run` and `logs` until `clean`."
     )]
     async fn build(
         &self,
@@ -827,17 +1150,17 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             async {
-                let sandbox = broker.sandbox_for(&parts)?;
-                broker.build(sandbox, params).await
+                let caller = broker.caller(&parts)?;
+                broker.build(&caller, params).await
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Run a command in a fresh container of a built image. Returns exit and \
-        the log tail (full log at .buildit/<build_id>/run.log); fetch_paths are copied out of \
-        the container into .buildit/<build_id>/<path>."
+        description = "Run a command in a fresh container of a runnable build. Returns exit and a \
+        log summary like build's, named run:<n> (copy at .buildit/<build_id>/run-<n>.log); \
+        fetch_paths are copied out of the container into .buildit/<build_id>/<path>."
     )]
     async fn run(
         &self,
@@ -847,14 +1170,36 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             async {
-                let sandbox = broker.sandbox_for(&parts)?;
-                broker.run(sandbox, params).await
+                let caller = broker.caller(&parts)?;
+                broker.run(&caller, params).await
             }
             .await,
         )
     }
 
-    #[tool(description = "Delete a build's builder pod, or all of this workspace's builds.")]
+    #[tool(
+        description = "Read part of a build or run log without pulling all of it. Select lines with \
+        from_line/to_line, then grep (regex, with context_lines), then head_lines or tail_lines; \
+        output is capped at max_bytes. Lines come back as `N:text` (`N-text` for context, `--` \
+        between gaps) with total_lines, matched, shown [first, last] and truncated. Without \
+        head_lines or from_line the cut keeps the end."
+    )]
+    async fn logs(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(params): Parameters<LogsParams>,
+    ) -> Result<String, String> {
+        let broker = &self.broker;
+        reply(
+            async {
+                let caller = broker.caller(&parts)?;
+                broker.logs(&caller, params).await
+            }
+            .await,
+        )
+    }
+
+    #[tool(description = "Delete a build's builder pod, or all of this sandbox's builds.")]
     async fn clean(
         &self,
         Extension(parts): Extension<Parts>,
@@ -863,10 +1208,8 @@ impl BuilditMcp {
         let broker = &self.broker;
         reply(
             async {
-                let sandbox = broker.sandbox_for(&parts)?;
-                let deleted = broker
-                    .clean(sandbox.as_ref(), params.build_id.as_deref())
-                    .await;
+                let caller = broker.caller(&parts)?;
+                let deleted = broker.clean(&caller, params.build_id.as_deref()).await?;
                 Ok(CleanReply { deleted })
             }
             .await,
@@ -887,25 +1230,23 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
 
+    use k8s_openapi::api::core::v1::Pod;
     use rmcp::ServiceExt;
     use rmcp::model::CallToolRequestParams;
     use rmcp::transport::StreamableHttpClientTransport;
     use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
-    use crate::backend::{Backend, PodOpts, Resources};
+    use crate::backend::{Backend, Resources};
     use crate::mcp::{
-        Broker, BuildParams, BuildRequest, MCP_PATH, SANDBOX_HEADER, Session, allowed_hosts,
-        authorized, constant_time_eq, fetch_argv, from_argv, rm_argv, router, run_argv,
-        serve_until, shutdown_signal, tail, unpack_fetched,
+        Broker, BuildId, BuildParams, BuildRequest, LABEL_BUILD_ID, MCP_PATH, SANDBOX_HEADER,
+        alive, allowed_hosts, authorized, constant_time_eq, fetch_argv, from_argv, kube_client,
+        owned_by, rm_argv, router, run_argv, selector, serve_until, unpack_fetched, within_cap,
     };
-    use crate::pod::BuilderPod;
-    use crate::sandbox::{RelPath, Workspace};
+    use crate::sandbox::{RelPath, SandboxName, Workspace};
 
     const TOKEN: &str = "s3cr3t-token";
 
@@ -1001,6 +1342,17 @@ mod tests {
         assert_eq!(req.build_args, ["A=1", "B=x=y z"]);
         assert_eq!(req.target.as_deref(), Some("builder"));
         assert_eq!(req.timeout, Duration::from_secs(7200));
+        assert_eq!(
+            req.annotations(),
+            [
+                ("buildit.dev/context".to_string(), "svc".to_string()),
+                (
+                    "buildit.dev/dockerfile".to_string(),
+                    "Dockerfile".to_string()
+                ),
+                ("buildit.dev/target".to_string(), "builder".to_string()),
+            ]
+        );
         for bad in ["", "A=B", "A B"] {
             let mut p = params("svc");
             p.build_args = BTreeMap::from([(bad.to_string(), "v".to_string())]);
@@ -1016,13 +1368,13 @@ mod tests {
     #[test]
     fn run_argv_shapes() {
         assert_eq!(
-            from_argv("localhost/buildit/b1:latest", "b1-run0"),
+            from_argv("localhost/buildit/b1:latest", "b1-run1"),
             [
                 "buildah",
                 "from",
                 "--pull-never",
                 "--name",
-                "b1-run0",
+                "b1-run1",
                 "localhost/buildit/b1:latest"
             ]
         );
@@ -1032,15 +1384,11 @@ mod tests {
             "echo hi; exit 3".to_string(),
         ];
         assert_eq!(
-            run_argv("b1-run0", &cmd, Duration::from_secs(42)),
+            run_argv("b1-run1", &cmd),
             [
-                "timeout",
-                "-k",
-                "10",
-                "42",
                 "buildah",
                 "run",
-                "b1-run0",
+                "b1-run1",
                 "--",
                 "sh",
                 "-c",
@@ -1051,18 +1399,571 @@ mod tests {
             RelPath::parse_container("/out/app").unwrap(),
             RelPath::parse_container("/etc/os-release").unwrap(),
         ];
-        let fetch = fetch_argv("b1-run0", &paths);
+        let fetch = fetch_argv("b1-run1", &paths);
         assert_eq!(fetch[..4], ["buildah", "unshare", "sh", "-c"]);
-        assert_eq!(fetch[5..], ["sh", "b1-run0", "out/app", "etc/os-release"]);
-        assert_eq!(rm_argv("b1-run0"), ["buildah", "rm", "b1-run0"]);
+        assert_eq!(fetch[5..], ["sh", "b1-run1", "out/app", "etc/os-release"]);
+        assert_eq!(rm_argv("b1-run1"), ["buildah", "rm", "b1-run1"]);
     }
 
+    #[test]
+    fn build_ids_cannot_smuggle_selectors() {
+        let fresh = BuildId::fresh();
+        assert_eq!(BuildId::parse(fresh.as_str()).unwrap(), fresh);
+        assert!(BuildId::parse("buildit-0a1b2c3d").is_ok());
+        for bad in [
+            "",
+            "Buildit-1",
+            "-x",
+            "x-",
+            "a,buildit.dev/sandbox=other",
+            "a=b",
+            "a b",
+            "a/b",
+            "a.b",
+            &"x".repeat(64),
+        ] {
+            assert!(BuildId::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(selector(&[("a/b", "c"), ("d", "e")]), "a/b=c,d=e");
+        assert!(Path::new(&crate::mcp::local_tag("buildit-1")).starts_with("localhost"));
+    }
+
+    fn pod(id: &str, sandbox: &str, created: &str, phase: Option<&str>) -> Pod {
+        serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "name": id,
+                "creationTimestamp": created,
+                "labels": {
+                    "buildit.dev/managed-by": "mcp",
+                    "buildit.dev/sandbox": sandbox,
+                    "buildit.dev/build-id": id,
+                }
+            },
+            "status": { "phase": phase }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn pods_belong_to_one_sandbox_and_rank_for_the_cap() {
+        let a = SandboxName::parse("sb-a").unwrap();
+        let b = SandboxName::parse("sb-b").unwrap();
+        let p = pod("buildit-1", "sb-a", "2026-10-01T10:00:00Z", Some("Running"));
+        assert!(owned_by(&p, &a));
+        assert!(!owned_by(&p, &b));
+        let mut unmanaged = p.clone();
+        unmanaged
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("buildit.dev/managed-by".to_string(), "cli".to_string());
+        assert!(!owned_by(&unmanaged, &a));
+        let mut bare = p.clone();
+        bare.metadata.labels = None;
+        assert!(!owned_by(&bare, &a));
+
+        assert!(alive(&p));
+        assert!(alive(&pod(
+            "x",
+            "sb-a",
+            "2026-10-01T10:00:00Z",
+            Some("Pending")
+        )));
+        assert!(alive(&pod("x", "sb-a", "2026-10-01T10:00:00Z", None)));
+        assert!(!alive(&pod(
+            "x",
+            "sb-a",
+            "2026-10-01T10:00:00Z",
+            Some("Failed")
+        )));
+        assert!(!alive(&pod(
+            "x",
+            "sb-a",
+            "2026-10-01T10:00:00Z",
+            Some("Succeeded")
+        )));
+        let mut going = p.clone();
+        going.metadata.deletion_timestamp = going.metadata.creation_timestamp.clone();
+        assert!(!alive(&going));
+
+        let live = [
+            pod("buildit-c", "sb-a", "2026-10-01T10:00:05Z", None),
+            pod("buildit-b", "sb-a", "2026-10-01T10:00:00Z", None),
+            pod("buildit-a", "sb-a", "2026-10-01T10:00:00Z", None),
+        ];
+        let id = |s: &str| BuildId::parse(s).unwrap();
+        assert!(within_cap(&live, 2, &id("buildit-a")));
+        assert!(within_cap(&live, 2, &id("buildit-b")));
+        assert!(!within_cap(&live, 2, &id("buildit-c")));
+        assert!(within_cap(&live, 3, &id("buildit-c")));
+        assert!(!within_cap(&live, 3, &id("buildit-z")));
+        assert_eq!(LABEL_BUILD_ID, "buildit.dev/build-id");
+    }
+
+    fn broker(workspace: Workspace) -> Arc<Broker> {
+        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        Arc::new(Broker {
+            client: kube::Client::try_from(config).unwrap(),
+            namespace: "builds".to_string(),
+            workspace,
+            backend: Backend::Buildah,
+            resources: Resources::default(),
+            deadline_secs: 600,
+            max_builds: 2,
+            owner: None,
+        })
+    }
+
+    fn parts(sandbox: Option<&str>) -> axum::http::request::Parts {
+        let mut req = axum::http::Request::builder();
+        if let Some(s) = sandbox {
+            req = req.header(SANDBOX_HEADER, s);
+        }
+        req.body(()).unwrap().into_parts().0
+    }
+
+    #[tokio::test]
+    async fn caller_identity_comes_from_one_place() {
+        let local = broker(Workspace::Local {
+            dir: std::env::temp_dir(),
+        });
+        assert_eq!(local.caller(&parts(None)).unwrap().as_str(), "local");
+        assert_eq!(local.caller(&parts(Some("sb-a"))).unwrap().as_str(), "sb-a");
+        assert!(local.caller(&parts(Some("--x"))).is_err());
+        let shell = broker(Workspace::Openshell {
+            workdir: "/sandbox".to_string(),
+        });
+        let err = shell.caller(&parts(None)).unwrap_err().to_string();
+        assert!(err.contains(SANDBOX_HEADER), "{err}");
+        assert_eq!(shell.caller(&parts(Some("sb-a"))).unwrap().as_str(), "sb-a");
+    }
+
+    async fn serve(workspace: Workspace) -> String {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let app = router(
+            broker(workspace),
+            TOKEN.to_string(),
+            allowed_hosts(None),
+            CancellationToken::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr.to_string()
+    }
+
+    struct Reply {
+        status: u16,
+        head: String,
+        body: String,
+    }
+
+    async fn exchange(addr: &str, req: String) -> Reply {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(600), sock.read_to_end(&mut out))
+            .await
+            .expect("response did not finish")
+            .unwrap();
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+        Reply {
+            status: head.split_whitespace().nth(1).unwrap().parse().unwrap(),
+            head: head.to_ascii_lowercase(),
+            body: body.to_string(),
+        }
+    }
+
+    fn http(method: &str, host: &str, auth: Option<&str>, extra: &str, body: &str) -> String {
+        let auth = auth
+            .map(|a| format!("Authorization: {a}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "{method} {MCP_PATH} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n{auth}{extra}Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_rejects_missing_or_wrong_token_and_foreign_hosts() {
+        let addr = serve(Workspace::Local {
+            dir: std::env::temp_dir(),
+        })
+        .await;
+        let bearer = format!("Bearer {TOKEN}");
+        let status = |host: &'static str, auth: Option<String>| {
+            let addr = addr.clone();
+            async move {
+                exchange(&addr, http("POST", host, auth.as_deref(), "", INIT))
+                    .await
+                    .status
+            }
+        };
+        assert_eq!(status("127.0.0.1", None).await, 401);
+        assert_eq!(status("127.0.0.1", Some("Bearer nope".into())).await, 401);
+        assert_eq!(status("127.0.0.1", Some(TOKEN.into())).await, 401);
+        assert_eq!(status("evil.example", Some(bearer.clone())).await, 403);
+        assert_eq!(
+            status("host.openshell.internal:8849", Some(bearer.clone())).await,
+            200
+        );
+        assert_eq!(
+            status("host.containers.internal", Some(bearer.clone())).await,
+            200
+        );
+        assert_eq!(status("127.0.0.1", Some(bearer)).await, 200);
+    }
+
+    fn jsonrpc(id: u32, method: &str, params: serde_json::Value) -> String {
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+            .to_string()
+    }
+
+    fn tool_text(reply: &Reply) -> (bool, String) {
+        let v: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+        let result = &v["result"];
+        (
+            result["isError"].as_bool().unwrap_or(false),
+            result["content"][0]["text"].as_str().unwrap().to_string(),
+        )
+    }
+
+    // a tools/call with no initialize and no session header, one POST
+    async fn raw_call(
+        addr: &str,
+        sandbox: &str,
+        name: &str,
+        args: serde_json::Value,
+    ) -> (bool, String) {
+        let body = jsonrpc(
+            7,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": args }),
+        );
+        let reply = exchange(
+            addr,
+            http(
+                "POST",
+                "127.0.0.1",
+                Some(&format!("Bearer {TOKEN}")),
+                &format!("{SANDBOX_HEADER}: {sandbox}\r\n"),
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(!reply.head.contains("mcp-session-id"), "{}", reply.head);
+        assert!(
+            reply.head.contains("content-type: application/json"),
+            "{}",
+            reply.head
+        );
+        tool_text(&reply)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stateless_posts_need_no_session_and_get_json() {
+        let addr = serve(Workspace::Local {
+            dir: std::env::temp_dir(),
+        })
+        .await;
+        let bearer = format!("Bearer {TOKEN}");
+
+        let init = exchange(&addr, http("POST", "127.0.0.1", Some(&bearer), "", INIT)).await;
+        assert_eq!(init.status, 200);
+        assert!(!init.head.contains("mcp-session-id"), "{}", init.head);
+        assert!(
+            init.head.contains("content-type: application/json"),
+            "{}",
+            init.head
+        );
+        assert!(init.body.contains("\"buildit\""), "{}", init.body);
+
+        // two unrelated POSTs, neither initialized nor carrying a session
+        for id in [2, 3] {
+            let list = exchange(
+                &addr,
+                http(
+                    "POST",
+                    "127.0.0.1",
+                    Some(&bearer),
+                    "",
+                    &jsonrpc(id, "tools/list", serde_json::json!({})),
+                ),
+            )
+            .await;
+            assert_eq!(list.status, 200, "{}", list.body);
+            assert!(!list.head.contains("mcp-session-id"), "{}", list.head);
+            assert!(!list.head.contains("text/event-stream"), "{}", list.head);
+            let v: serde_json::Value = serde_json::from_str(&list.body).unwrap();
+            assert_eq!(v["id"], id);
+            let mut names: Vec<&str> = v["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect();
+            names.sort();
+            assert_eq!(names, ["build", "clean", "logs", "run"]);
+        }
+
+        let (is_error, text) = raw_call(
+            &addr,
+            "sb-a",
+            "logs",
+            serde_json::json!({ "build_id": "Nope,x=y" }),
+        )
+        .await;
+        assert!(is_error);
+        assert!(text.contains("invalid build_id"), "{text}");
+
+        for method in ["GET", "DELETE"] {
+            let r = exchange(&addr, http(method, "127.0.0.1", Some(&bearer), "", "")).await;
+            assert_eq!(r.status, 405, "{method}: {}", r.body);
+        }
+    }
+
+    async fn client(
+        addr: &str,
+        token: &str,
+        sandbox: Option<&str>,
+    ) -> Result<
+        rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        Box<rmcp::service::ClientInitializeError>,
+    > {
+        let mut headers = HashMap::new();
+        if let Some(name) = sandbox {
+            headers.insert(SANDBOX_HEADER.parse().unwrap(), name.parse().unwrap());
+        }
+        let config =
+            StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}{MCP_PATH}"))
+                .auth_header(token)
+                .custom_headers(headers);
+        ().serve(StreamableHttpClientTransport::from_config(config))
+            .await
+            .map_err(Box::new)
+    }
+
+    fn text(result: &rmcp::model::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    fn call(name: &'static str, args: serde_json::Value) -> CallToolRequestParams {
+        let serde_json::Value::Object(map) = args else {
+            panic!("tool args must be an object")
+        };
+        CallToolRequestParams::new(name).with_arguments(map)
+    }
+
+    type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+    async fn call_ok(c: &Client, name: &'static str, args: serde_json::Value) -> serde_json::Value {
+        let r = c.call_tool(call(name, args)).await.unwrap();
+        assert_ne!(r.is_error, Some(true), "{name}: {}", text(&r));
+        serde_json::from_str(&text(&r)).unwrap()
+    }
+
+    async fn call_err(c: &Client, name: &'static str, args: serde_json::Value) -> String {
+        let r = c.call_tool(call(name, args)).await.unwrap();
+        assert_eq!(r.is_error, Some(true), "{name}: {}", text(&r));
+        text(&r)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_round_trip_lists_tools_and_reports_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = serve(Workspace::Local {
+            dir: dir.path().to_path_buf(),
+        })
+        .await;
+
+        assert!(
+            client(&addr, "wrong", None).await.is_err(),
+            "initialize must fail without the right token"
+        );
+
+        let c = client(&addr, TOKEN, Some("ci-1-abc")).await.unwrap();
+        let tools = c.list_all_tools().await.unwrap();
+        let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["build", "clean", "logs", "run"]);
+        let keys = |name: &str| {
+            let t = tools.iter().find(|t| t.name == name).unwrap();
+            let mut keys: Vec<_> = t.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys("build"),
+            ["build_args", "context", "dockerfile", "target", "timeout_s"]
+        );
+        assert_eq!(
+            keys("logs"),
+            [
+                "build_id",
+                "context_lines",
+                "from_line",
+                "grep",
+                "head_lines",
+                "max_bytes",
+                "tail_lines",
+                "to_line",
+                "which"
+            ]
+        );
+        let schemas = serde_json::to_string(&tools).unwrap();
+        assert!(!schemas.to_lowercase().contains("secret"), "{schemas}");
+
+        let e = call_err(&c, "build", serde_json::json!({ "context": "../escape" })).await;
+        assert!(e.contains("`..`"), "{e}");
+        let e = call_err(&c, "build", serde_json::json!({ "context": "." })).await;
+        assert!(e.contains("subdirectory"), "{e}");
+        let e = call_err(
+            &c,
+            "run",
+            serde_json::json!({ "build_id": "x,y", "cmd": ["true"] }),
+        )
+        .await;
+        assert!(e.contains("invalid build_id"), "{e}");
+        let e = call_err(
+            &c,
+            "run",
+            serde_json::json!({ "build_id": "buildit-1", "cmd": [] }),
+        )
+        .await;
+        assert!(e.contains("cmd must not be empty"), "{e}");
+        let e = call_err(
+            &c,
+            "logs",
+            serde_json::json!({ "build_id": "buildit-1", "which": "run:0" }),
+        )
+        .await;
+        assert!(e.contains("which must be"), "{e}");
+        let e = call_err(
+            &c,
+            "logs",
+            serde_json::json!({ "build_id": "buildit-1", "head_lines": 1, "tail_lines": 1 }),
+        )
+        .await;
+        assert!(e.contains("not both"), "{e}");
+        let e = call_err(
+            &c,
+            "logs",
+            serde_json::json!({ "build_id": "buildit-1", "grep": "(" }),
+        )
+        .await;
+        assert!(e.contains("invalid grep"), "{e}");
+        let e = call_err(&c, "clean", serde_json::json!({ "build_id": "A" })).await;
+        assert!(e.contains("invalid build_id"), "{e}");
+        c.cancel().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openshell_mode_refuses_requests_without_a_sandbox_header() {
+        let addr = serve(Workspace::Openshell {
+            workdir: "/sandbox/repo".to_string(),
+        })
+        .await;
+        let c = client(&addr, TOKEN, None).await.unwrap();
+        let e = call_err(&c, "build", serde_json::json!({ "context": "svc" })).await;
+        assert!(e.contains(SANDBOX_HEADER), "{e}");
+        c.cancel().await.unwrap();
+
+        let c = client(&addr, TOKEN, Some("--gateway=evil")).await.unwrap();
+        let e = call_err(&c, "clean", serde_json::json!({})).await;
+        assert!(e.contains("invalid sandbox name"), "{e}");
+        c.cancel().await.unwrap();
+    }
+
+    struct Server {
+        addr: String,
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    async fn start(broker: Arc<Broker>, grace: Duration) -> Server {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(
+            listener,
+            broker,
+            TOKEN.to_string(),
+            allowed_hosts(None),
+            async move {
+                let _ = stopped.await;
+            },
+            grace,
+        ));
+        Server { addr, stop, task }
+    }
+
+    impl Server {
+        async fn shut_down(self) {
+            self.stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), self.task)
+                .await
+                .expect("server did not stop within 5s")
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_does_not_wait_on_idle_connections() {
+        let server = start(
+            broker(Workspace::Local {
+                dir: std::env::temp_dir(),
+            }),
+            Duration::from_secs(60),
+        )
+        .await;
+        // a keep-alive connection that already got its answer
+        let mut idle = tokio::net::TcpStream::connect(&server.addr).await.unwrap();
+        let req = http(
+            "POST",
+            "127.0.0.1",
+            Some(&format!("Bearer {TOKEN}")),
+            "",
+            INIT,
+        )
+        .replace("Connection: close\r\n", "");
+        idle.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 4096];
+        let n = idle.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        server.shut_down().await;
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), idle.read_to_end(&mut rest))
+            .await
+            .expect("idle connection stayed open")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     fn tar_with(build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> Vec<u8> {
         let mut b = tar::Builder::new(Vec::new());
         build(&mut b);
         b.into_inner().unwrap()
     }
 
+    #[cfg(unix)]
     fn file_header(path: &str, len: usize) -> tar::Header {
         let mut h = tar::Header::new_gnu();
         h.set_path(path).unwrap();
@@ -1128,401 +2029,269 @@ mod tests {
         assert!(!dir.path().join("evil").exists());
     }
 
-    #[test]
-    fn tail_caps_lines_and_bytes() {
-        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
-        let t = tail(&text);
-        assert!(t.starts_with("line 40"), "{t}");
-        assert!(t.ends_with("line 99"), "{t}");
-        let wide = "é".repeat(10_000);
-        let t = tail(&wide);
-        assert!(t.len() <= 8 * 1024);
-        assert!(t.chars().all(|c| c == 'é'));
-    }
-
-    fn broker(workspace: Workspace) -> Arc<Broker> {
-        broker_at(workspace, "http://127.0.0.1:9")
-    }
-
-    fn broker_at(workspace: Workspace, api: &str) -> Arc<Broker> {
-        let config = kube::Config::new(api.parse().unwrap());
+    async fn cluster_broker(dir: &Path, max_builds: usize) -> Arc<Broker> {
+        let ctx = std::env::var("BUILDIT_E2E_KUBECONTEXT")
+            .expect("set BUILDIT_E2E_KUBECONTEXT to a disposable cluster's context");
+        let ns = std::env::var("BUILDIT_E2E_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+        let (client, namespace, _) = kube_client(Some(&ctx), Some(&ns)).await.unwrap();
         Arc::new(Broker {
-            client: kube::Client::try_from(config).unwrap(),
-            namespace: "builds".to_string(),
-            workspace,
+            client,
+            namespace,
+            workspace: Workspace::Local {
+                dir: dir.to_path_buf(),
+            },
             backend: Backend::Buildah,
             resources: Resources::default(),
-            deadline_secs: 600,
-            max_sessions: 2,
+            deadline_secs: 900,
+            max_builds,
             owner: None,
-            sessions: Mutex::new(Vec::new()),
-            runs: AtomicU64::new(0),
         })
     }
 
-    async fn serve(workspace: Workspace) -> String {
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn json(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {text}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_builds_survive_a_restart_and_stay_in_their_sandbox() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let app = router(
-            broker(workspace),
-            TOKEN.to_string(),
-            allowed_hosts(None),
-            CancellationToken::new(),
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        write(
+            &dir.join("svc/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\n\
+             RUN echo hello-from-build && mkdir -p /out && echo artifact > /out/a.txt\n",
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        addr.to_string()
-    }
-
-    // one initialize POST over a bare socket, so Host and Authorization are
-    // exactly what we say; returns the status code
-    async fn raw_initialize(addr: &str, host: &str, auth: Option<&str>) -> u16 {
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
-        let auth = auth
-            .map(|a| format!("Authorization: {a}\r\n"))
-            .unwrap_or_default();
-        let req = format!(
-            "POST {MCP_PATH} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-             Accept: application/json, text/event-stream\r\n{auth}Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            body.len()
+        write(
+            &dir.join("bad/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\n\
+             RUN echo 'main.c:3: undefined reference to frob' && exit 3\n",
         );
-        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        sock.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = [0u8; 64];
-        let mut read = 0;
-        while !buf[..read].windows(2).any(|w| w == b"\r\n") {
-            let n = sock.read(&mut buf[read..]).await.unwrap();
-            assert!(n > 0, "connection closed before a status line");
-            read += n;
-        }
-        let line = String::from_utf8_lossy(&buf[..read]).into_owned();
-        line.split_whitespace().nth(1).unwrap().parse().unwrap()
-    }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn http_rejects_missing_or_wrong_token_and_foreign_hosts() {
-        let addr = serve(Workspace::Local {
-            dir: std::env::temp_dir(),
-        })
-        .await;
-        let bearer = format!("Bearer {TOKEN}");
-        assert_eq!(raw_initialize(&addr, "127.0.0.1", None).await, 401);
-        assert_eq!(
-            raw_initialize(&addr, "127.0.0.1", Some("Bearer nope")).await,
-            401
-        );
-        assert_eq!(raw_initialize(&addr, "127.0.0.1", Some(TOKEN)).await, 401);
-        assert_eq!(
-            raw_initialize(&addr, "evil.example", Some(&bearer)).await,
-            403
-        );
-        assert_eq!(
-            raw_initialize(&addr, "host.openshell.internal:8849", Some(&bearer)).await,
-            200
-        );
-        assert_eq!(
-            raw_initialize(&addr, "host.containers.internal", Some(&bearer)).await,
-            200
-        );
-        assert_eq!(raw_initialize(&addr, "127.0.0.1", Some(&bearer)).await, 200);
-    }
-
-    async fn client(
-        addr: &str,
-        token: &str,
-        sandbox: Option<&str>,
-    ) -> Result<
-        rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        Box<rmcp::service::ClientInitializeError>,
-    > {
-        let mut headers = HashMap::new();
-        if let Some(name) = sandbox {
-            headers.insert(SANDBOX_HEADER.parse().unwrap(), name.parse().unwrap());
-        }
-        let config =
-            StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}{MCP_PATH}"))
-                .auth_header(token)
-                .custom_headers(headers);
-        ().serve(StreamableHttpClientTransport::from_config(config))
-            .await
-            .map_err(Box::new)
-    }
-
-    fn text(result: &rmcp::model::CallToolResult) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect()
-    }
-
-    fn call(name: &'static str, args: serde_json::Value) -> CallToolRequestParams {
-        let serde_json::Value::Object(map) = args else {
-            panic!("tool args must be an object")
-        };
-        CallToolRequestParams::new(name).with_arguments(map)
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn mcp_round_trip_lists_tools_and_reports_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let addr = serve(Workspace::Local {
-            dir: dir.path().to_path_buf(),
-        })
-        .await;
-
+        let first = start(cluster_broker(&dir, 2).await, Duration::from_secs(5)).await;
+        let a = client(&first.addr, TOKEN, Some("sb-a")).await.unwrap();
+        let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        assert_eq!(built["exit"], 0, "{built}");
+        assert_eq!(built["runnable"], true, "{built}");
+        assert_eq!(built["timed_out"], false);
+        assert_eq!(built["log"]["log"], "build");
+        assert!(built["log"].get("errors").is_none(), "{built}");
         assert!(
-            client(&addr, "wrong", None).await.is_err(),
-            "initialize must fail without the right token"
+            built["log"]["tail"]
+                .as_str()
+                .unwrap()
+                .contains("hello-from-build"),
+            "{built}"
         );
-
-        let c = client(&addr, TOKEN, Some("ci-1-abc")).await.unwrap();
-        let tools = c.list_all_tools().await.unwrap();
-        let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
-        names.sort();
-        assert_eq!(names, ["build", "clean", "run"]);
-        let build = tools.iter().find(|t| t.name == "build").unwrap();
-        let props = build.input_schema["properties"].as_object().unwrap();
-        let mut keys: Vec<_> = props.keys().cloned().collect();
-        keys.sort();
+        let id = built["build_id"].as_str().unwrap().to_string();
         assert_eq!(
-            keys,
-            ["build_args", "context", "dockerfile", "target", "timeout_s"]
+            built["log"]["path"],
+            format!(".buildit/{id}/build.log").as_str()
         );
-        let schemas = serde_json::to_string(&tools).unwrap();
-        assert!(!schemas.to_lowercase().contains("secret"), "{schemas}");
+        assert!(dir.join(format!(".buildit/{id}/build.log")).is_file());
 
-        let r = c
-            .call_tool(call("build", serde_json::json!({ "context": "../escape" })))
+        let broker = cluster_broker(&dir, 2).await;
+        let pods = broker
+            .list(&[("buildit.dev/build-id", id.as_str())])
             .await
             .unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("`..`"), "{}", text(&r));
+        assert_eq!(pods.len(), 1);
+        let labels = pods[0].metadata.labels.clone().unwrap();
+        assert_eq!(labels["buildit.dev/sandbox"], "sb-a");
+        assert_eq!(labels["buildit.dev/managed-by"], "mcp");
+        assert_eq!(labels["buildit.dev/state"], "built");
+        let notes = pods[0].metadata.annotations.clone().unwrap();
+        assert_eq!(notes["buildit.dev/context"], "svc");
+        assert_eq!(notes["buildit.dev/dockerfile"], "Dockerfile");
 
-        let r = c
-            .call_tool(call("build", serde_json::json!({ "context": "." })))
-            .await
-            .unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("subdirectory"), "{}", text(&r));
+        a.cancel().await.unwrap();
+        first.shut_down().await;
 
-        let r = c
-            .call_tool(call(
-                "run",
-                serde_json::json!({ "build_id": "buildit-nope", "cmd": ["true"] }),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("no live build"), "{}", text(&r));
-
-        let r = c
-            .call_tool(call("clean", serde_json::json!({})))
-            .await
-            .unwrap();
-        assert_ne!(r.is_error, Some(true));
-        assert_eq!(text(&r), r#"{"deleted":[]}"#);
-        c.cancel().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn openshell_mode_refuses_requests_without_a_sandbox_header() {
-        let addr = serve(Workspace::Openshell {
-            workdir: "/sandbox/repo".to_string(),
-        })
+        // a new process with no memory of the build
+        let second = start(broker, Duration::from_secs(5)).await;
+        let (is_error, text) = raw_call(
+            &second.addr,
+            "sb-a",
+            "run",
+            serde_json::json!({
+                "build_id": id,
+                "cmd": ["sh", "-c", "echo out-1; echo error: on stderr >&2; exit 5"],
+                "fetch_paths": ["/out/a.txt", "/nope"],
+            }),
+        )
         .await;
-        let c = client(&addr, TOKEN, None).await.unwrap();
-        let r = c
-            .call_tool(call("build", serde_json::json!({ "context": "svc" })))
-            .await
-            .unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains(SANDBOX_HEADER), "{}", text(&r));
-        c.cancel().await.unwrap();
-
-        let c = client(&addr, TOKEN, Some("--gateway=evil")).await.unwrap();
-        let r = c
-            .call_tool(call("clean", serde_json::json!({})))
-            .await
-            .unwrap();
-        assert_eq!(r.is_error, Some(true));
-        assert!(text(&r).contains("invalid sandbox name"), "{}", text(&r));
-        c.cancel().await.unwrap();
-    }
-
-    #[test]
-    fn local_tag_is_not_pushable() {
-        assert!(Path::new(&crate::mcp::local_tag("buildit-1")).starts_with("localhost"));
-    }
-
-    async fn apiserver() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        use axum::extract::{Path as UrlPath, State};
-        use axum::http::{StatusCode, header};
-        use axum::routing::{delete, post};
-        type Seen = Arc<std::sync::Mutex<Vec<String>>>;
-        type Reply = (StatusCode, [(header::HeaderName, &'static str); 1], String);
-        async fn create(State(seen): State<Seen>, pod: String) -> Reply {
-            seen.lock().unwrap().push("POST pods".to_string());
-            (
-                StatusCode::CREATED,
-                [(header::CONTENT_TYPE, "application/json")],
-                pod,
-            )
-        }
-        async fn remove(
-            State(seen): State<Seen>,
-            UrlPath((ns, name)): UrlPath<(String, String)>,
-        ) -> Reply {
-            seen.lock().unwrap().push(format!("DELETE {ns}/{name}"));
-            let pod = serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": { "name": name, "namespace": ns },
-            });
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                pod.to_string(),
-            )
-        }
-        let seen: Seen = Arc::default();
-        let app = axum::Router::new()
-            .route("/api/v1/namespaces/{ns}/pods", post(create))
-            .route("/api/v1/namespaces/{ns}/pods/{name}", delete(remove))
-            .with_state(seen.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}"), seen)
-    }
-
-    async fn exchange(addr: &str, req: String) -> String {
-        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        sock.write_all(req.as_bytes()).await.unwrap();
-        let mut out = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut out))
-            .await
-            .expect("response did not finish")
-            .unwrap();
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    fn post(body: &str, session: Option<&str>) -> String {
-        let session = session
-            .map(|s| format!("Mcp-Session-Id: {s}\r\nMCP-Protocol-Version: 2025-06-18\r\n"))
-            .unwrap_or_default();
-        format!(
-            "POST {MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\n\
-             Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
-             {session}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
-    async fn open_sse(addr: &str) -> tokio::net::TcpStream {
-        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
-        let reply = exchange(addr, post(init, None)).await;
-        let session = reply
-            .lines()
-            .find_map(|l| {
-                l.to_ascii_lowercase()
-                    .strip_prefix("mcp-session-id:")
-                    .map(|_| l["mcp-session-id:".len()..].trim().to_string())
-            })
-            .unwrap_or_else(|| panic!("no session id in {reply}"));
-        let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        let reply = exchange(addr, post(note, Some(&session))).await;
-        assert!(reply.starts_with("HTTP/1.1 202"), "{reply}");
-
-        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let get = format!(
-            "GET {MCP_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {TOKEN}\r\n\
-             Accept: text/event-stream\r\nMcp-Session-Id: {session}\r\n\
-             MCP-Protocol-Version: 2025-06-18\r\n\r\n"
+        assert!(!is_error, "{text}");
+        let ran = json(&text);
+        assert_eq!(ran["exit"], 5, "{ran}");
+        assert_eq!(ran["log"]["log"], "run:1");
+        let tail = ran["log"]["tail"].as_str().unwrap();
+        assert!(
+            tail.contains("out-1") && tail.contains("error: on stderr"),
+            "{ran}"
         );
-        sock.write_all(get.as_bytes()).await.unwrap();
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = sock.read(&mut buf).await.unwrap();
-            assert!(n > 0, "sse stream closed before its headers");
-            head.extend_from_slice(&buf[..n]);
-        }
-        let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
-        assert!(head.starts_with("http/1.1 200"), "{head}");
-        assert!(head.contains("text/event-stream"), "{head}");
-        sock
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sigterm_closes_open_streams_and_deletes_builder_pods() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let (api, seen) = apiserver().await;
-        let broker = broker_at(
-            Workspace::Local {
-                dir: std::env::temp_dir(),
-            },
-            &api,
+        assert!(
+            ran["log"]["errors"]
+                .as_str()
+                .unwrap()
+                .contains("error: on stderr"),
+            "{ran}"
         );
-        let resources = Resources::default();
-        let opts = PodOpts {
-            idle_nodes: &[],
-            resources: &resources,
-            cache: None,
-            node: None,
-            deadline_secs: 600,
-            owner: None,
-        };
-        let pod = BuilderPod::create_named(
-            broker.client.clone(),
-            "builds",
-            Backend::Buildah,
-            "buildit-term",
-            &opts,
-        )
-        .await
-        .unwrap();
-        broker
-            .keep(Session {
-                id: "buildit-term".to_string(),
-                pod,
-                sandbox: None,
-            })
-            .await;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = tokio::spawn(serve_until(
-            listener,
-            broker,
-            TOKEN.to_string(),
-            allowed_hosts(None),
-            shutdown_signal().unwrap(),
-            Duration::from_secs(60),
-        ));
-        let mut sse = open_sse(&addr).await;
-
-        let killed = std::process::Command::new("kill")
-            .args(["-TERM", &std::process::id().to_string()])
-            .status()
-            .unwrap();
-        assert!(killed.success());
-
-        let deleted = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("server did not exit within 5s of SIGTERM")
-            .unwrap()
-            .unwrap();
-        assert_eq!(deleted, ["buildit-term"]);
         assert_eq!(
-            *seen.lock().unwrap(),
-            ["POST pods", "DELETE builds/buildit-term"]
+            ran["fetched"],
+            serde_json::json!([format!(".buildit/{id}/out/a.txt")])
         );
-        let mut rest = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), sse.read_to_end(&mut rest))
-            .await
-            .expect("sse stream stayed open")
-            .unwrap();
+        assert_eq!(ran["missing"], serde_json::json!(["nope"]));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!(".buildit/{id}/out/a.txt"))).unwrap(),
+            "artifact\n"
+        );
+        assert!(dir.join(format!(".buildit/{id}/run-1.log")).is_file());
+
+        let a = client(&second.addr, TOKEN, Some("sb-a")).await.unwrap();
+        let ran = call_ok(
+            &a,
+            "run",
+            serde_json::json!({ "build_id": id, "cmd": ["true"] }),
+        )
+        .await;
+        assert_eq!(ran["exit"], 0, "{ran}");
+        assert_eq!(ran["log"]["log"], "run:2");
+
+        let page = call_ok(
+            &a,
+            "logs",
+            serde_json::json!({ "build_id": id, "which": "build", "grep": "^hello-from-build$", "context_lines": 1 }),
+        )
+        .await;
+        assert_eq!(page["log"], "build");
+        assert_eq!(page["matched"], 1, "{page}");
+        assert!(
+            page["lines"]
+                .as_str()
+                .unwrap()
+                .contains(":hello-from-build\n"),
+            "{page}"
+        );
+        assert_eq!(page["lines"].as_str().unwrap().lines().count(), 3, "{page}");
+        assert_eq!(page["truncated"], false);
+
+        let latest = call_ok(&a, "logs", serde_json::json!({ "build_id": id })).await;
+        assert_eq!(latest["log"], "run:2");
+        assert_eq!(
+            latest["logs"],
+            serde_json::json!(["build", "run:1", "run:2"])
+        );
+
+        let head = call_ok(
+            &a,
+            "logs",
+            serde_json::json!({ "build_id": id, "which": "run:1", "head_lines": 1 }),
+        )
+        .await;
+        assert!(
+            head["lines"]
+                .as_str()
+                .unwrap()
+                .starts_with("1:$ buildah from"),
+            "{head}"
+        );
+        let total = head["total_lines"].as_u64().unwrap();
+        let range = call_ok(
+            &a,
+            "logs",
+            serde_json::json!({ "build_id": id, "which": "run:1", "from_line": 2, "to_line": total }),
+        )
+        .await;
+        assert_eq!(range["shown"], serde_json::json!([2, total]), "{range}");
+        let capped = call_ok(
+            &a,
+            "logs",
+            serde_json::json!({ "build_id": id, "which": "build", "max_bytes": 2048, "from_line": 1 }),
+        )
+        .await;
+        assert!(capped["lines"].as_str().unwrap().len() <= 2048);
+        assert!(
+            capped["lines"].as_str().unwrap().starts_with("1:"),
+            "{capped}"
+        );
+        let e = call_err(
+            &a,
+            "logs",
+            serde_json::json!({ "build_id": id, "which": "run:9" }),
+        )
+        .await;
+        assert!(e.contains("no run:9 log"), "{e}");
+
+        // another sandbox sees nothing of sb-a's build
+        let b = client(&second.addr, TOKEN, Some("sb-b")).await.unwrap();
+        for (tool, args) in [
+            (
+                "run",
+                serde_json::json!({ "build_id": id, "cmd": ["true"] }),
+            ),
+            ("logs", serde_json::json!({ "build_id": id })),
+        ] {
+            let e = call_err(&b, tool, args).await;
+            assert!(e.contains("no live build"), "{tool}: {e}");
+        }
+        let cleaned = call_ok(&b, "clean", serde_json::json!({ "build_id": id })).await;
+        assert_eq!(cleaned["deleted"], serde_json::json!([]));
+        let (is_error, text) = raw_call(
+            &second.addr,
+            "sb-b",
+            "logs",
+            serde_json::json!({ "build_id": id }),
+        )
+        .await;
+        assert!(is_error && text.contains("no live build"), "{text}");
+
+        let bad = call_ok(&a, "build", serde_json::json!({ "context": "bad" })).await;
+        assert_ne!(bad["exit"], 0, "{bad}");
+        assert_eq!(bad["runnable"], false);
+        assert!(
+            bad["log"]["errors"]
+                .as_str()
+                .unwrap()
+                .contains("undefined reference to frob"),
+            "{bad}"
+        );
+        let bad_id = bad["build_id"].as_str().unwrap().to_string();
+        let e = call_err(
+            &a,
+            "run",
+            serde_json::json!({ "build_id": bad_id, "cmd": ["true"] }),
+        )
+        .await;
+        assert!(e.contains("not runnable"), "{e}");
+
+        let e = call_err(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        assert!(e.contains("max 2"), "{e}");
+        assert!(e.contains(&id) && e.contains(&bad_id), "{e}");
+        let other = call_ok(&b, "build", serde_json::json!({ "context": "bad" })).await;
+        let other_id = other["build_id"].as_str().unwrap().to_string();
+
+        let cleaned = call_ok(&a, "clean", serde_json::json!({})).await;
+        let mut want = vec![id.clone(), bad_id.clone()];
+        want.sort();
+        assert_eq!(cleaned["deleted"], serde_json::json!(want));
+        let cleaned = call_ok(&b, "clean", serde_json::json!({ "build_id": other_id })).await;
+        assert_eq!(cleaned["deleted"], serde_json::json!([other_id]));
+        for sandbox in ["sb-a", "sb-b"] {
+            let name = SandboxName::parse(sandbox).unwrap();
+            let broker = cluster_broker(&dir, 2).await;
+            assert!(broker.live_builds(&name).await.unwrap().is_empty());
+        }
+        let e = call_err(&a, "logs", serde_json::json!({ "build_id": id })).await;
+        assert!(e.contains("no live build"), "{e}");
+
+        a.cancel().await.unwrap();
+        b.cancel().await.unwrap();
+        second.shut_down().await;
     }
 }

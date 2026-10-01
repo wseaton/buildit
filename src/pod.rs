@@ -1,10 +1,11 @@
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Status;
-use kube::api::{Api, AttachParams, AttachedProcess, DeleteParams, ListParams, PostParams};
+use kube::api::{
+    Api, AttachParams, AttachedProcess, DeleteParams, ListParams, Patch, PatchParams, PostParams,
+};
 use kube::runtime::wait::{await_condition, conditions};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -23,21 +24,6 @@ impl LogSink {
             out: Box::new(tokio::io::stdout()),
             err: Box::new(tokio::io::stderr()),
         }
-    }
-
-    pub fn file(path: &Path) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .with_context(|| format!("opening log {}", path.display()))?;
-        let err = file
-            .try_clone()
-            .with_context(|| format!("cloning log handle {}", path.display()))?;
-        Ok(Self {
-            out: Box::new(tokio::fs::File::from_std(file)),
-            err: Box::new(tokio::fs::File::from_std(err)),
-        })
     }
 
     pub async fn line(&mut self, line: &str) -> Result<()> {
@@ -135,6 +121,26 @@ impl BuilderPod {
         })
     }
 
+    pub fn existing(client: kube::Client, namespace: &str, name: &str) -> Self {
+        Self {
+            pods: Api::namespaced(client, namespace),
+            name: name.to_string(),
+        }
+    }
+
+    pub async fn set_labels(&self, labels: &[(&str, &str)]) -> Result<()> {
+        let labels: serde_json::Map<String, serde_json::Value> = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), serde_json::json!(v)))
+            .collect();
+        let patch = serde_json::json!({ "metadata": { "labels": labels } });
+        self.pods
+            .patch(&self.name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .with_context(|| format!("labelling pod {}", self.name))?;
+        Ok(())
+    }
+
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         tokio::time::timeout(
             timeout,
@@ -203,6 +209,24 @@ impl BuilderPod {
         out.context("streaming exec stdout")?;
         err.context("streaming exec stderr")?;
         sink.flush().await?;
+        self.status(attached).await
+    }
+
+    // output is discarded
+    pub async fn exec_status(&self, argv: &[String]) -> Result<ExecStatus> {
+        let mut attached = self.attach(argv, false).await?;
+        let mut stdout = attached
+            .stdout()
+            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
+        let mut stderr = attached
+            .stderr()
+            .ok_or_else(|| anyhow!("exec stderr stream missing"))?;
+        let (mut out_sink, mut err_sink) = (tokio::io::sink(), tokio::io::sink());
+        let out = tokio::io::copy(&mut stdout, &mut out_sink);
+        let err = tokio::io::copy(&mut stderr, &mut err_sink);
+        let (out, err) = tokio::join!(out, err);
+        out.context("draining exec stdout")?;
+        err.context("draining exec stderr")?;
         self.status(attached).await
     }
 

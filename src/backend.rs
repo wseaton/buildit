@@ -4,6 +4,8 @@ use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
+pub const BACKEND_LABEL: &str = "buildit/backend";
+
 #[derive(Clone, Copy)]
 pub enum CacheVolume<'a> {
     Pvc(&'a str),
@@ -18,6 +20,15 @@ pub struct PodOpts<'a> {
     pub node: Option<&'a str>,
     pub deadline_secs: i64,
     pub owner: Option<&'a OwnerReference>,
+    pub meta: Option<&'a PodMeta>,
+}
+
+#[derive(Default)]
+pub struct PodMeta {
+    pub labels: Vec<(String, String)>,
+    pub annotations: Vec<(String, String)>,
+    // emptyDir mount path
+    pub log_dir: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -305,6 +316,12 @@ impl Backend {
         }
     }
 
+    pub fn from_label(label: &str) -> Option<Self> {
+        [Backend::Buildkit, Backend::Kaniko, Backend::Buildah]
+            .into_iter()
+            .find(|b| b.label() == label)
+    }
+
     // where a persistent cache volume pays off for each backend
     fn cache_mount_path(&self) -> &'static str {
         match self {
@@ -413,6 +430,28 @@ impl Backend {
         });
         if let Some(owner) = opts.owner {
             spec["metadata"]["ownerReferences"] = serde_json::json!([owner]);
+        }
+        if let Some(meta) = opts.meta {
+            for (k, v) in &meta.labels {
+                spec["metadata"]["labels"][k] = serde_json::json!(v);
+            }
+            for (k, v) in &meta.annotations {
+                spec["metadata"]["annotations"][k] = serde_json::json!(v);
+            }
+            if let Some(dir) = &meta.log_dir {
+                let vols = spec["spec"]["volumes"]
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow!("pod volumes are not a list"))?;
+                vols.push(serde_json::json!({ "name": "buildit-logs", "emptyDir": {} }));
+                let mounts = &mut spec["spec"]["containers"][0]["volumeMounts"];
+                if mounts.is_null() {
+                    *mounts = serde_json::json!([]);
+                }
+                mounts
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow!("builder volumeMounts are not a list"))?
+                    .push(serde_json::json!({ "name": "buildit-logs", "mountPath": dir }));
+            }
         }
         if matches!(opts.cache, Some(CacheVolume::Pvc(_))) {
             // fresh PVC filesystems are root:root 0755 (unlike 0777 emptyDirs);
@@ -939,6 +978,7 @@ mod tests {
             node: None,
             deadline_secs: 7200,
             owner: None,
+            meta: None,
         }
     }
 
@@ -1155,5 +1195,61 @@ mod tests {
                 Some(false)
             );
         }
+    }
+
+    #[test]
+    fn pod_meta_adds_labels_annotations_and_a_log_volume() {
+        let none = Resources::default();
+        let meta = crate::backend::PodMeta {
+            labels: vec![("buildit.dev/build-id".to_string(), "b1".to_string())],
+            annotations: vec![("buildit.dev/context".to_string(), "svc".to_string())],
+            log_dir: Some("/buildit/logs".to_string()),
+        };
+        for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
+            let pod = backend
+                .pod_spec(
+                    "b1",
+                    "builds",
+                    &crate::backend::PodOpts {
+                        meta: Some(&meta),
+                        ..opts(&[], &none)
+                    },
+                )
+                .unwrap();
+            let labels = pod.metadata.labels.unwrap();
+            assert_eq!(labels["buildit.dev/build-id"], "b1");
+            assert_eq!(labels["app"], "buildit");
+            assert_eq!(labels[crate::backend::BACKEND_LABEL], backend.label());
+            let notes = pod.metadata.annotations.unwrap();
+            assert_eq!(notes["buildit.dev/context"], "svc");
+            assert!(notes.contains_key("container.apparmor.security.beta.kubernetes.io/builder"));
+            let spec = pod.spec.unwrap();
+            let vols = spec.volumes.unwrap();
+            assert!(
+                vols.iter()
+                    .any(|v| v.name == "buildit-logs" && v.empty_dir.is_some()),
+                "{backend:?}"
+            );
+            let mounts = spec.containers[0].volume_mounts.clone().unwrap();
+            assert!(
+                mounts
+                    .iter()
+                    .any(|m| m.name == "buildit-logs" && m.mount_path == "/buildit/logs"),
+                "{backend:?}"
+            );
+            assert_eq!(Backend::from_label(backend.label()), Some(backend));
+
+            let plain = backend.pod_spec("b1", "builds", &opts(&[], &none)).unwrap();
+            assert!(
+                !plain
+                    .spec
+                    .unwrap()
+                    .volumes
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|v| v.name == "buildit-logs")
+            );
+        }
+        assert_eq!(Backend::from_label("docker"), None);
     }
 }
