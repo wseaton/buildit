@@ -14,7 +14,8 @@ use clap::Args;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::Api;
-use kube::api::{DeleteParams, ListParams};
+use kube::api::{ApiResource, DeleteParams, DynamicObject, ListParams};
+use kube::core::GroupVersion;
 use rmcp::handler::server::common::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
@@ -57,6 +58,7 @@ const FROM_TIMEOUT_S: u64 = 300;
 const EXEC_SLACK: Duration = Duration::from_secs(60);
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const MAX_OWNER_DEPTH: usize = 4;
 
 #[derive(Args)]
 pub struct McpArgs {
@@ -246,20 +248,82 @@ async fn kube_client(
 
 async fn self_owner(client: kube::Client, namespace: &str) -> Option<OwnerReference> {
     let name = std::env::var("HOSTNAME").ok()?;
-    let pods: Api<Pod> = Api::namespaced(client, namespace);
-    match pods.get(&name).await {
-        Ok(pod) => Some(OwnerReference {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            name,
-            uid: pod.metadata.uid?,
-            ..Default::default()
-        }),
+    match workload_owner(client, namespace, &name).await {
+        Ok(owner) => {
+            tracing::info!("builder pods are owned by {} {}", owner.kind, owner.name);
+            Some(owner)
+        }
         Err(e) => {
-            tracing::warn!("cannot read own pod {name} ({e}); builder pods get no owner");
+            tracing::warn!("cannot read own pod {name} ({e:#}); builder pods get no owner");
             None
         }
     }
+}
+
+// the top of the pod's controller chain, e.g. Pod -> ReplicaSet -> Deployment
+async fn workload_owner(
+    client: kube::Client,
+    namespace: &str,
+    pod: &str,
+) -> Result<OwnerReference> {
+    let me = Api::<Pod>::namespaced(client.clone(), namespace)
+        .get(pod)
+        .await
+        .with_context(|| format!("reading pod {pod}"))?;
+    let mut owner = OwnerReference {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        name: pod.to_string(),
+        uid: me
+            .metadata
+            .uid
+            .ok_or_else(|| anyhow!("pod {pod} has no uid"))?,
+        ..Default::default()
+    };
+    let mut refs = me.metadata.owner_references.unwrap_or_default();
+    for _ in 0..MAX_OWNER_DEPTH {
+        let Some(up) = refs.into_iter().find(|r| r.controller == Some(true)) else {
+            break;
+        };
+        owner = OwnerReference {
+            api_version: up.api_version,
+            kind: up.kind,
+            name: up.name,
+            uid: up.uid,
+            ..Default::default()
+        };
+        refs = match controller_refs(client.clone(), namespace, &owner).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::warn!(
+                    "cannot read {} {} ({e:#}); owning builder pods by it",
+                    owner.kind,
+                    owner.name
+                );
+                break;
+            }
+        };
+    }
+    Ok(owner)
+}
+
+async fn controller_refs(
+    client: kube::Client,
+    namespace: &str,
+    of: &OwnerReference,
+) -> Result<Vec<OwnerReference>> {
+    let gvk = of
+        .api_version
+        .parse::<GroupVersion>()
+        .with_context(|| format!("apiVersion {:?}", of.api_version))?
+        .with_kind(&of.kind);
+    let api: Api<DynamicObject> =
+        Api::namespaced_with(client, namespace, &ApiResource::from_gvk(&gvk));
+    let obj = api.get(&of.name).await?;
+    if obj.metadata.uid.as_deref() != Some(of.uid.as_str()) {
+        bail!("uid changed");
+    }
+    Ok(obj.metadata.owner_references.unwrap_or_default())
 }
 
 fn env_hosts() -> Option<String> {
@@ -1265,7 +1329,7 @@ mod tests {
         Broker, BuildId, BuildParams, BuildRequest, LABEL_BUILD_ID, MCP_PATH, SANDBOX_HEADER,
         alive, allowed_hosts, authorized, constant_time_eq, fetch_argv, from_argv, kube_client,
         owned_by, rm_argv, router, run_argv, selector, serve_until, step_outcome, unpack_fetched,
-        within_cap,
+        within_cap, workload_owner,
     };
     use crate::sandbox::{RelPath, SandboxName, Workspace};
 
@@ -2373,5 +2437,143 @@ mod tests {
         a.cancel().await.unwrap();
         b.cancel().await.unwrap();
         second.shut_down().await;
+    }
+
+    async fn wait_until(what: &str, secs: u64, mut done: impl AsyncFnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        while !done().await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_builder_pods_outlive_a_restart_of_the_serving_pod() {
+        use k8s_openapi::api::apps::v1::Deployment;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        use kube::Api;
+        use kube::api::{DeleteParams, ListParams, PostParams};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ctx = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let ns = std::env::var("BUILDIT_E2E_NAMESPACE").unwrap_or_else(|_| "default".to_string());
+        let (client, ns, _) = kube_client(Some(&ctx), Some(&ns)).await.unwrap();
+        let deployments: Api<Deployment> = Api::namespaced(client.clone(), &ns);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+        let name = BuildId::fresh()
+            .to_string()
+            .replace("buildit-", "owner-e2e-");
+        let sleeper = |name: &str, owner: Option<&OwnerReference>| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": name, "ownerReferences": owner.map(|o| vec![o]) },
+                "spec": {
+                    "terminationGracePeriodSeconds": 0,
+                    "containers": [{
+                        "name": "c",
+                        "image": "docker.io/library/busybox:latest",
+                        "command": ["sleep", "3600"]
+                    }]
+                }
+            }))
+            .unwrap()
+        };
+        let deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": name },
+            "spec": {
+                "replicas": 1,
+                "selector": { "matchLabels": { "app": name } },
+                "template": {
+                    "metadata": { "labels": { "app": name } },
+                    "spec": sleeper(&name, None).spec
+                }
+            }
+        }))
+        .unwrap();
+        let deployment = deployments
+            .create(&PostParams::default(), &deployment)
+            .await
+            .unwrap();
+        let by_app = ListParams::default().labels(&format!("app={name}"));
+        let live_server = async || {
+            pods.list(&by_app)
+                .await
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|p| p.metadata.deletion_timestamp.is_none())
+                .and_then(|p| p.metadata.name)
+        };
+        let mut first = None;
+        wait_until("the deployment's pod", 60, async || {
+            first = live_server().await;
+            first.is_some()
+        })
+        .await;
+        let first = first.unwrap();
+
+        let owner = workload_owner(client.clone(), &ns, &first).await.unwrap();
+        assert_eq!(owner.kind, "Deployment");
+        assert_eq!(owner.api_version, "apps/v1");
+        assert_eq!(owner.name, name);
+        assert_eq!(Some(&owner.uid), deployment.metadata.uid.as_ref());
+        assert_eq!(owner.controller, None);
+
+        let pod_owner = OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            name: first.clone(),
+            uid: pods.get(&first).await.unwrap().metadata.uid.unwrap(),
+            ..Default::default()
+        };
+        let kept = format!("{name}-kept");
+        let lost = format!("{name}-lost");
+        pods.create(&PostParams::default(), &sleeper(&kept, Some(&owner)))
+            .await
+            .unwrap();
+        pods.create(&PostParams::default(), &sleeper(&lost, Some(&pod_owner)))
+            .await
+            .unwrap();
+        let bare = workload_owner(client.clone(), &ns, &kept).await.unwrap();
+        assert_eq!(
+            (bare.kind.as_str(), bare.name.as_str()),
+            ("Pod", kept.as_str())
+        );
+
+        // a restart of the serving pod: the deployment replaces it
+        pods.delete(&first, &DeleteParams::default()).await.unwrap();
+        wait_until("the pod-owned builder to be collected", 60, async || {
+            pods.get_opt(&lost)
+                .await
+                .unwrap()
+                .is_none_or(|p| p.metadata.deletion_timestamp.is_some())
+        })
+        .await;
+        wait_until("a replacement serving pod", 60, async || {
+            live_server().await.is_some_and(|n| n != first)
+        })
+        .await;
+        let survivor = pods.get(&kept).await.unwrap();
+        assert!(survivor.metadata.deletion_timestamp.is_none());
+
+        // deleting the workload takes the builder with it
+        deployments
+            .delete(&name, &DeleteParams::background())
+            .await
+            .unwrap();
+        wait_until(
+            "the deployment-owned builder to be collected",
+            90,
+            async || {
+                pods.get_opt(&kept)
+                    .await
+                    .unwrap()
+                    .is_none_or(|p| p.metadata.deletion_timestamp.is_some())
+            },
+        )
+        .await;
     }
 }

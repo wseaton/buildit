@@ -154,7 +154,9 @@ appended inside the pod under `/buildit/logs` by the commands themselves;
 copies land at `.buildit/<build_id>/build.log` and `run-<n>.log`. A sandbox
 may hold `--max-builds` live builder pods (default 4); past that `build` is
 refused until `clean`. Builder pods are not deleted on shutdown: they go with
-the serving pod (ownerReference), at `--pod-deadline`, or on `clean`.
+the serving workload (an ownerReference to the top of the serving pod's
+controller chain, e.g. its Deployment, which takes `get` on that chain's
+kinds), at `--pod-deadline`, or on `clean`.
 
 Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
 `X-Crucible-Sandbox` header naming the sandbox; a build is only visible to the
@@ -165,7 +167,7 @@ as links when they resolve inside the context and are dropped otherwise.
 `.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube`, `.jira` are never
 shipped, and results are never written through a symlink under `.buildit`.
 Builder pods get no service account token, no service links, an
-`activeDeadlineSeconds`, and an ownerReference to the serving pod.
+`activeDeadlineSeconds`, and an ownerReference to the serving workload.
 
 ```sh
 # in-cluster (namespace from the service account)
