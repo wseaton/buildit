@@ -143,9 +143,11 @@ streamable http, for an agent in a sandbox that can't build images itself
 Requests need `Authorization: Bearer $BROKER_TOKEN` and, in sandbox mode, an
 `X-Crucible-Sandbox` header naming the sandbox. `Host` must be loopback,
 `host.openshell.internal`, `host.containers.internal`, or listed in
-`BROKER_ALLOWED_HOSTS`. The context must be a subdirectory, symlinks are
-refused, and `.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube`, `.jira` are
-never shipped. Builder pods get no service account token, no service links,
+`BROKER_ALLOWED_HOSTS`. The context must be a subdirectory not reached through
+a symlink. Symlinks inside it ship as links when they resolve inside the
+context and are dropped otherwise. `.git`, `.mcp.json`, `.claude`, `.buildit`,
+`.kube`, `.jira` are never shipped, and results are never written through a
+symlink under `.buildit`. Builder pods get no service account token, no service links,
 an `activeDeadlineSeconds`, and an ownerReference to the serving pod.
 
 ```sh

@@ -323,6 +323,7 @@ dependencies = [
  "kube",
  "oci-client",
  "rmcp",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

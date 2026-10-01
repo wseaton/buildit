@@ -1,7 +1,13 @@
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+use rustix::io::Errno;
 
 pub const EXCLUDED: [&str; 6] = [".git", ".mcp.json", ".claude", ".buildit", ".kube", ".jira"];
 
@@ -95,9 +101,11 @@ impl Workspace {
                 })?;
             }
             Workspace::Local { dir } => {
-                let src = confined(dir, ctx)?;
+                let src = open_beneath(dir, ctx)?;
                 let _ = std::fs::remove_dir_all(dest);
-                copy_tree(&src, dest)?;
+                std::fs::create_dir_all(dest)
+                    .with_context(|| format!("creating {}", dest.display()))?;
+                copy_dir(&src, &open_root(dest)?, Path::new(""), Links::Keep)?;
             }
         }
         sanitize(dest)
@@ -118,11 +126,15 @@ impl Workspace {
                 Ok(())
             }
             Workspace::Local { dir } => {
-                let root = dir.join(RESULTS_DIR);
-                refuse_symlink(&root)?;
-                let dest = root.join(id);
-                refuse_symlink(&dest)?;
-                copy_tree(results, &dest)
+                let root = ensure_dir(&open_root(dir)?, OsStr::new(RESULTS_DIR), RESULTS_DIR)?;
+                let shown = format!("{RESULTS_DIR}/{id}");
+                let dest = ensure_dir(&root, OsStr::new(id), &shown)?;
+                copy_dir(
+                    &open_root(results)?,
+                    &dest,
+                    Path::new(&shown),
+                    Links::Refuse,
+                )
             }
         }
     }
@@ -235,66 +247,149 @@ fn verified_sync(
     )
 }
 
-fn confined(root: &Path, rel: &RelPath) -> Result<PathBuf> {
-    let mut path = root.to_path_buf();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Links {
+    Keep,
+    Refuse,
+}
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+const MAX_LINK_HOPS: u32 = 40;
+
+const TMP_ATTEMPTS: u32 = 64;
+
+fn open_root(path: &Path) -> Result<OwnedFd> {
+    rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening {}", path.display()))
+}
+
+fn is_symlink(dir: &OwnedFd, name: &OsStr) -> bool {
+    rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Symlink)
+}
+
+fn open_dir(parent: &OwnedFd, name: &OsStr, shown: &str) -> Result<OwnedFd> {
+    match rustix::fs::openat(parent, name, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(fd),
+        Err(_) if is_symlink(parent, name) => bail!("symlinks are refused: {shown} is a link"),
+        Err(Errno::NOTDIR) => bail!("{shown} is not a directory"),
+        Err(e) => Err(e).with_context(|| format!("opening {shown}")),
+    }
+}
+
+fn ensure_dir(parent: &OwnedFd, name: &OsStr, shown: &str) -> Result<OwnedFd> {
+    match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o755)) {
+        Ok(()) | Err(Errno::EXIST) => open_dir(parent, name, shown),
+        Err(e) => Err(e).with_context(|| format!("creating {shown}")),
+    }
+}
+
+fn open_beneath(root: &Path, rel: &RelPath) -> Result<OwnedFd> {
+    let mut dir = open_root(root)?;
     for part in rel.as_str().split('/') {
-        path.push(part);
-        if refuse_symlink(&path).is_err() {
-            bail!("symlinks are refused: {} is a link", rel.as_str());
-        }
+        dir = open_dir(&dir, OsStr::new(part), rel.as_str())?;
     }
-    if !path.is_dir() {
-        bail!("context {} is not a directory", rel.as_str());
-    }
-    Ok(path)
+    Ok(dir)
 }
 
-fn refuse_symlink(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            bail!("symlinks are refused: {}", path.display())
-        }
-        _ => Ok(()),
-    }
-}
-
-fn is_excluded(name: &std::ffi::OsStr) -> bool {
+fn is_excluded(name: &OsStr) -> bool {
     name.to_str().is_some_and(|n| EXCLUDED.contains(&n))
 }
 
-fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
-    copy_tree_in(src, src, dest)
+fn entries(dir: &OwnedFd, shown: &Path) -> Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(dir).with_context(|| format!("reading {}", shown.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", shown.display()))?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        if name != "." && name != ".." {
+            names.push(name.to_os_string());
+        }
+    }
+    Ok(names)
 }
 
-fn copy_tree_in(root: &Path, src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
-    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-        if is_excluded(&entry.file_name()) {
+fn copy_dir(src: &OwnedFd, dest: &OwnedFd, shown: &Path, links: Links) -> Result<()> {
+    for name in entries(src, shown)? {
+        if is_excluded(&name) {
             continue;
         }
-        let from = entry.path();
-        let rel = from
-            .strip_prefix(root)
-            .unwrap_or(&from)
-            .display()
-            .to_string();
-        let to = dest.join(entry.file_name());
-        let ft = entry
-            .file_type()
-            .with_context(|| format!("inspecting {rel}"))?;
-        if ft.is_symlink() {
-            bail!("symlinks are refused: {rel}");
-        } else if ft.is_dir() {
-            copy_tree_in(root, &from, &to)?;
-        } else if ft.is_file() {
-            refuse_symlink(&to)?;
-            std::fs::copy(&from, &to).with_context(|| format!("copying {rel}"))?;
-        } else {
-            bail!("special files are refused: {rel}");
+        let rel = shown.join(&name);
+        let rel_s = rel.display().to_string();
+        let st = rustix::fs::statat(src, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .with_context(|| format!("inspecting {rel_s}"))?;
+        match FileType::from_raw_mode(st.st_mode) {
+            FileType::Directory => {
+                let from = open_dir(src, &name, &rel_s)?;
+                let to = ensure_dir(dest, &name, &rel_s)?;
+                copy_dir(&from, &to, &rel, links)?;
+            }
+            FileType::RegularFile => copy_file(src, dest, &name, &rel_s)?,
+            FileType::Symlink if links == Links::Keep => {
+                let target = rustix::fs::readlinkat(src, &name, Vec::new())
+                    .with_context(|| format!("reading link {rel_s}"))?;
+                rustix::fs::symlinkat(target.as_c_str(), dest, &name)
+                    .with_context(|| format!("copying link {rel_s}"))?;
+            }
+            FileType::Symlink => bail!("symlinks are refused: {rel_s}"),
+            _ => bail!("special files are refused: {rel_s}"),
         }
     }
     Ok(())
+}
+
+fn copy_file(src: &OwnedFd, dest: &OwnedFd, name: &OsStr, shown: &str) -> Result<()> {
+    let from = rustix::fs::openat(
+        src,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("opening {shown}"))?;
+    let st = rustix::fs::fstat(&from).with_context(|| format!("inspecting {shown}"))?;
+    if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+        bail!("{shown} changed type while being copied");
+    }
+    let (tmp, to) = create_tmp(dest, shown)?;
+    let written = (|| -> Result<()> {
+        rustix::fs::fchmod(&to, Mode::from_raw_mode(st.st_mode & 0o7777))
+            .with_context(|| format!("setting mode on {shown}"))?;
+        std::io::copy(&mut File::from(from), &mut File::from(to))
+            .with_context(|| format!("copying {shown}"))?;
+        if is_symlink(dest, name) {
+            bail!("symlinks are refused: {shown}");
+        }
+        rustix::fs::renameat(dest, &tmp, dest, name)
+            .with_context(|| format!("moving {shown} into place"))
+    })();
+    if written.is_err() {
+        let _ = rustix::fs::unlinkat(dest, &tmp, AtFlags::empty());
+    }
+    written
+}
+
+fn create_tmp(dir: &OwnedFd, shown: &str) -> Result<(OsString, OwnedFd)> {
+    for n in 0..TMP_ATTEMPTS {
+        let name = OsString::from(format!(".buildit-tmp-{n}"));
+        match rustix::fs::openat(
+            dir,
+            &name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => return Ok((name, fd)),
+            Err(Errno::EXIST) => continue,
+            Err(e) => return Err(e).with_context(|| format!("creating a temp file for {shown}")),
+        }
+    }
+    bail!("no free temp name for {shown}")
 }
 
 pub fn sanitize(root: &Path) -> Result<()> {
@@ -321,7 +416,10 @@ fn sanitize_in(root: &Path, dir: &Path) -> Result<()> {
             }
             .with_context(|| format!("removing excluded {rel}"))?;
         } else if ft.is_symlink() {
-            bail!("symlinks are refused in the build context: {rel}");
+            if !link_stays_inside(root, &path)? {
+                tracing::info!("skipping symlink {rel}: it points outside the build context");
+                std::fs::remove_file(&path).with_context(|| format!("removing link {rel}"))?;
+            }
         } else if ft.is_dir() {
             sanitize_in(root, &path)?;
         } else if !ft.is_file() {
@@ -331,6 +429,67 @@ fn sanitize_in(root: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+enum Step {
+    Up,
+    Name(OsString),
+}
+
+fn push_target(todo: &mut Vec<Step>, target: &Path) -> bool {
+    let mut steps = Vec::new();
+    for comp in target.components() {
+        match comp {
+            Component::Normal(name) => steps.push(Step::Name(name.to_os_string())),
+            Component::ParentDir => steps.push(Step::Up),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    todo.extend(steps.into_iter().rev());
+    true
+}
+
+fn link_stays_inside(root: &Path, link: &Path) -> Result<bool> {
+    let mut at: Vec<OsString> = link
+        .parent()
+        .and_then(|p| p.strip_prefix(root).ok())
+        .map(|p| p.iter().map(OsStr::to_os_string).collect())
+        .unwrap_or_default();
+    let mut todo = Vec::new();
+    let target = std::fs::read_link(link).with_context(|| format!("reading {}", link.display()))?;
+    if !push_target(&mut todo, &target) {
+        return Ok(false);
+    }
+    let mut hops = 0;
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Up => {
+                if at.pop().is_none() {
+                    return Ok(false);
+                }
+            }
+            Step::Name(name) => {
+                let here: PathBuf = root
+                    .iter()
+                    .chain(at.iter().map(OsString::as_os_str))
+                    .chain([name.as_os_str()])
+                    .collect();
+                match std::fs::symlink_metadata(&here) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        hops += 1;
+                        let next = std::fs::read_link(&here)
+                            .with_context(|| format!("reading {}", here.display()))?;
+                        if hops > MAX_LINK_HOPS || !push_target(&mut todo, &next) {
+                            return Ok(false);
+                        }
+                    }
+                    _ => at.push(name),
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -338,13 +497,14 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::Path;
 
     use crate::sandbox::{
-        EXCLUDED, RelPath, SandboxName, Workspace, download_argv, sanitize, tree_hash_argv,
-        upload_argv, verified_sync,
+        EXCLUDED, RelPath, SandboxName, Workspace, download_argv, link_stays_inside, sanitize,
+        tree_hash_argv, upload_argv, verified_sync,
     };
 
     fn touch(path: &Path) {
@@ -548,18 +708,112 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn sanitize_refuses_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        touch(&dir.path().join("a/f"));
-        std::os::unix::fs::symlink("/etc/passwd", dir.path().join("a/link")).unwrap();
-        let err = sanitize(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("symlinks are refused"), "{err}");
-        assert!(err.contains("a/link"), "{err}");
+    fn link(target: &str, at: &Path) {
+        fs::create_dir_all(at.parent().unwrap()).unwrap();
+        symlink(target, at).unwrap();
     }
 
-    #[cfg(unix)]
+    fn links(root: &Path) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let ft = e.file_type().unwrap();
+                let p = e.path();
+                if ft.is_symlink() {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                    let target = fs::read_link(&p).unwrap().to_string_lossy().into_owned();
+                    out.insert(rel, target);
+                } else if ft.is_dir() {
+                    walk(root, &p, out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[test]
+    fn sanitize_keeps_links_inside_the_context_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ctx");
+        touch(&root.join("AGENTS.md"));
+        touch(&root.join("sub/file"));
+        link("AGENTS.md", &root.join("CLAUDE.md"));
+        link(
+            "../AGENTS.md",
+            &root.join(".github/copilot-instructions.md"),
+        );
+        link("sub", &root.join("docs"));
+        link("./sub/../sub/./file", &root.join("dotted"));
+        link("missing", &root.join("dangling"));
+        link("docs/file", &root.join("via-dir-link"));
+        link("/etc/passwd", &root.join("absolute"));
+        link("../outside", &root.join("parent"));
+        link("../../../etc/passwd", &root.join("sub/deep"));
+        link("../..", &root.join("a/b/top"));
+        link("../../..", &root.join("a/b/above"));
+        sanitize(&root).unwrap();
+        assert_eq!(
+            links(&root),
+            BTreeMap::from(
+                [
+                    ("CLAUDE.md", "AGENTS.md"),
+                    (".github/copilot-instructions.md", "../AGENTS.md"),
+                    ("docs", "sub"),
+                    ("dotted", "./sub/../sub/./file"),
+                    ("dangling", "missing"),
+                    ("via-dir-link", "docs/file"),
+                    ("a/b/top", "../.."),
+                ]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+            )
+        );
+        assert!(tree(&root).contains("sub/file"));
+    }
+
+    #[test]
+    fn link_resolution_follows_nested_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("ctx");
+        touch(&root.join("a/b/x"));
+        link("../../..", &root.join("a/b/up"));
+        link("a/b/up/../x", &root.join("lexically-inside"));
+        link("a/b/../b/x", &root.join("inside"));
+        link("loop2", &root.join("loop1"));
+        link("loop1", &root.join("loop2"));
+        link("/etc/passwd", &root.join("absolute"));
+        link("absolute", &root.join("via-absolute"));
+        link("a/b/up", &root.join("via-up"));
+        for (name, inside) in [
+            ("lexically-inside", false),
+            ("inside", true),
+            ("loop1", false),
+            ("loop2", false),
+            ("via-absolute", false),
+            ("via-up", false),
+        ] {
+            assert_eq!(
+                link_stays_inside(&root, &root.join(name)).unwrap(),
+                inside,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_refuses_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let err = sanitize(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("special files are refused"), "{err}");
+    }
+
     #[test]
     fn local_fetch_copies_the_subdir_minus_exclusions() {
         let work = tempfile::tempdir().unwrap();
@@ -584,35 +838,111 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn local_fetch_refuses_symlinked_context_and_contents() {
+    fn local_fetch_refuses_a_symlinked_context() {
         let work = tempfile::tempdir().unwrap();
         let w = work.path();
         let outside = tempfile::tempdir().unwrap();
         touch(&outside.path().join("Dockerfile"));
-        std::os::unix::fs::symlink(outside.path(), w.join("escape")).unwrap();
+        symlink(outside.path(), w.join("escape")).unwrap();
+        touch(&outside.path().join("svc/Dockerfile"));
+        symlink(outside.path(), w.join("hop")).unwrap();
+        touch(&w.join("file"));
         let ws = Workspace::Local {
             dir: w.to_path_buf(),
         };
         let out = tempfile::tempdir().unwrap();
-        let err = ws
-            .fetch_context(
-                None,
-                &RelPath::parse("escape").unwrap(),
-                &out.path().join("a"),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlinks are refused"), "{err}");
+        for (ctx, want) in [
+            ("escape", "symlinks are refused"),
+            ("hop/svc", "symlinks are refused"),
+            ("file", "not a directory"),
+        ] {
+            let err = ws
+                .fetch_context(None, &RelPath::parse(ctx).unwrap(), &out.path().join("a"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{ctx}: {err}");
+        }
+    }
 
+    #[test]
+    fn local_fetch_ships_inner_links_and_skips_outer_ones() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let outside = tempfile::tempdir().unwrap();
+        touch(&outside.path().join("secret"));
         touch(&w.join("svc/Dockerfile"));
-        std::os::unix::fs::symlink("/etc/hosts", w.join("svc/hosts")).unwrap();
-        let err = ws
-            .fetch_context(None, &RelPath::parse("svc").unwrap(), &out.path().join("b"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("symlinks are refused"), "{err}");
+        touch(&w.join("svc/AGENTS.md"));
+        touch(&w.join("svc/tools/run.sh"));
+        fs::set_permissions(
+            w.join("svc/tools/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        touch(&w.join("other/secret"));
+        link("AGENTS.md", &w.join("svc/CLAUDE.md"));
+        link(
+            "../AGENTS.md",
+            &w.join("svc/.github/copilot-instructions.md"),
+        );
+        link(
+            outside.path().join("secret").to_str().unwrap(),
+            &w.join("svc/abs"),
+        );
+        link("../other/secret", &w.join("svc/sibling"));
+        link(outside.path().to_str().unwrap(), &w.join("svc/outdir"));
+        let ws = Workspace::Local {
+            dir: w.to_path_buf(),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("ctx");
+        ws.fetch_context(None, &RelPath::parse("svc").unwrap(), &dest)
+            .unwrap();
+        assert_eq!(
+            links(&dest),
+            BTreeMap::from([
+                ("CLAUDE.md".to_string(), "AGENTS.md".to_string()),
+                (
+                    ".github/copilot-instructions.md".to_string(),
+                    "../AGENTS.md".to_string()
+                ),
+            ])
+        );
+        assert_eq!(
+            fs::metadata(dest.join("tools/run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+
+        let bytes = crate::context::tar_bytes(&dest).unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut kinds = BTreeMap::new();
+        for e in archive.entries().unwrap() {
+            let e = e.unwrap();
+            let path = e.path().unwrap().to_string_lossy().into_owned();
+            let target = e
+                .link_name()
+                .unwrap()
+                .map(|t| t.to_string_lossy().into_owned());
+            kinds.insert(path, (e.header().entry_type(), target));
+        }
+        assert_eq!(
+            kinds["CLAUDE.md"],
+            (tar::EntryType::Symlink, Some("AGENTS.md".to_string()))
+        );
+        assert_eq!(
+            kinds[".github/copilot-instructions.md"],
+            (tar::EntryType::Symlink, Some("../AGENTS.md".to_string()))
+        );
+        assert!(
+            !kinds
+                .keys()
+                .any(|k| k.contains("secret") || k.starts_with("abs") || k.starts_with("outdir")),
+            "{kinds:?}"
+        );
     }
 
     #[test]
@@ -650,5 +980,81 @@ mod tests {
                 "out/bin/app".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn local_publish_never_writes_through_symlinks() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let results = stage.path().join("buildit-0001");
+        touch(&results.join("build.log"));
+        touch(&results.join("out/bin/app"));
+
+        for at in [
+            ".buildit",
+            ".buildit/buildit-0001",
+            ".buildit/buildit-0001/out",
+            ".buildit/buildit-0001/out/bin",
+        ] {
+            let work = tempfile::tempdir().unwrap();
+            link(elsewhere.path().to_str().unwrap(), &work.path().join(at));
+            let ws = Workspace::Local {
+                dir: work.path().to_path_buf(),
+            };
+            let err = ws.publish(None, &results).unwrap_err().to_string();
+            assert!(err.contains("symlinks are refused"), "{at}: {err}");
+            assert_eq!(
+                fs::read_dir(elsewhere.path()).unwrap().count(),
+                0,
+                "{at}: wrote outside the results dir"
+            );
+        }
+    }
+
+    #[test]
+    fn local_publish_replaces_planted_file_links_without_touching_targets() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        fs::write(&victim, b"original").unwrap();
+        let stage = tempfile::tempdir().unwrap();
+        let results = stage.path().join("buildit-0001");
+        fs::create_dir_all(&results).unwrap();
+        fs::write(results.join("build.log"), b"log").unwrap();
+        fs::write(results.join("run.log"), b"log").unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let dest = work.path().join(".buildit/buildit-0001");
+        fs::create_dir_all(&dest).unwrap();
+        symlink(&victim, dest.join("build.log")).unwrap();
+        let ws = Workspace::Local {
+            dir: work.path().to_path_buf(),
+        };
+        let err = ws.publish(None, &results).unwrap_err().to_string();
+        assert!(err.contains("symlinks are refused"), "{err}");
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+
+        fs::remove_file(dest.join("build.log")).unwrap();
+        fs::hard_link(&victim, dest.join("build.log")).unwrap();
+        ws.publish(None, &results).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert_eq!(fs::read(dest.join("build.log")).unwrap(), b"log");
+        assert_eq!(
+            tree(&dest),
+            BTreeSet::from(["build.log".to_string(), "run.log".to_string()])
+        );
+    }
+
+    #[test]
+    fn local_publish_refuses_links_in_the_results() {
+        let stage = tempfile::tempdir().unwrap();
+        let results = stage.path().join("buildit-0001");
+        touch(&results.join("build.log"));
+        symlink("/etc/passwd", results.join("passwd")).unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let ws = Workspace::Local {
+            dir: work.path().to_path_buf(),
+        };
+        let err = ws.publish(None, &results).unwrap_err().to_string();
+        assert!(err.contains("symlinks are refused"), "{err}");
     }
 }
