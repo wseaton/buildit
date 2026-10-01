@@ -1502,6 +1502,7 @@ mod tests {
     }
 
     fn broker(workspace: Workspace) -> Arc<Broker> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
         Arc::new(Broker {
             client: kube::Client::try_from(config).unwrap(),
@@ -1540,7 +1541,6 @@ mod tests {
     }
 
     async fn serve(workspace: Workspace) -> String {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let app = router(
             broker(workspace),
             TOKEN.to_string(),
