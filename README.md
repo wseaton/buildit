@@ -153,7 +153,8 @@ restarted server or a second replica keeps serving existing builds. Logs are
 appended inside the pod under `/buildit/logs` (a 1Gi emptyDir) by the commands
 themselves; copies of their last 32 MiB land at `.buildit/<build_id>/build.log`
 and `run-<n>.log`. A sandbox may hold `--max-builds` live builder pods
-(default 4); past that `build` is refused until `clean`. A `build` call that
+(default 4), and the namespace `--max-builds-total` across every sandbox and
+server (default 16); past either `build` is refused until a `clean`. A `build` call that
 returns an error, or is cut off by a disconnect or shutdown, deletes its pod;
 other builder pods survive a shutdown and go with the serving workload (an
 ownerReference to the top of the serving pod's controller chain, e.g. its

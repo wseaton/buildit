@@ -100,6 +100,10 @@ pub struct McpArgs {
     /// Live builder pods per sandbox; `build` is refused past this
     #[arg(long, default_value_t = 4)]
     pub max_builds: usize,
+    /// Live builder pods in the namespace, every sandbox and server counted; `build` is refused
+    /// past this
+    #[arg(long, default_value_t = 16)]
+    pub max_builds_total: usize,
     /// Resource requests for builder pods, repeatable: --request cpu=2
     #[arg(long = "request", value_name = "KEY=QTY", value_parser = crate::parse_kv)]
     pub requests: Vec<(String, String)>,
@@ -186,6 +190,7 @@ pub async fn serve(args: McpArgs) -> Result<()> {
         },
         deadline_secs: args.pod_deadline,
         max_builds: args.max_builds.max(1),
+        max_builds_total: args.max_builds_total.max(1),
         owner,
         calls: TaskTracker::new(),
     });
@@ -589,6 +594,13 @@ fn pod_name(pod: &Pod) -> &str {
     pod.metadata.name.as_deref().unwrap_or_default()
 }
 
+fn admits(live: &[Pod], cap: usize, me: Option<&BuildId>) -> bool {
+    match me {
+        None => live.len() < cap,
+        Some(id) => within_cap(live, cap, id),
+    }
+}
+
 // pods created in the same second as `id` count as older
 fn within_cap(live: &[Pod], cap: usize, id: &BuildId) -> bool {
     let created = |p: &Pod| p.metadata.creation_timestamp.as_ref().map(|t| t.0);
@@ -668,6 +680,7 @@ pub struct Broker {
     resources: Resources,
     deadline_secs: i64,
     max_builds: usize,
+    max_builds_total: usize,
     owner: Option<OwnerReference>,
     // in-flight tool calls, drained on shutdown
     calls: TaskTracker,
@@ -1003,39 +1016,43 @@ impl Broker {
             .items)
     }
 
-    async fn live_builds(&self, caller: &SandboxName) -> Result<Vec<Pod>> {
-        let pods = self
-            .list(&[
-                (LABEL_MANAGED_BY, MANAGED_BY),
-                (LABEL_SANDBOX, caller.as_str()),
-            ])
-            .await?;
-        Ok(pods
-            .into_iter()
-            .filter(|p| alive(p) && owned_by(p, caller))
-            .collect())
+    async fn live_builds(&self) -> Result<Vec<Pod>> {
+        let pods = self.list(&[(LABEL_MANAGED_BY, MANAGED_BY)]).await?;
+        Ok(pods.into_iter().filter(alive).collect())
     }
 
     async fn check_cap(&self, caller: &SandboxName, me: Option<&BuildId>) -> Result<()> {
-        let live = self.live_builds(caller).await?;
-        let ok = match me {
-            None => live.len() < self.max_builds,
-            Some(id) => within_cap(&live, self.max_builds, id),
-        };
-        if ok {
-            return Ok(());
-        }
-        let ids: Vec<&str> = live
+        let every = self.live_builds().await?;
+        let mine: Vec<Pod> = every
             .iter()
-            .filter_map(|p| label(p, LABEL_BUILD_ID))
-            .filter(|id| me.is_none_or(|me| me.as_str() != *id))
+            .filter(|p| owned_by(p, caller))
+            .cloned()
             .collect();
-        bail!(
-            "this sandbox has {} live builds (max {}): {}; clean one first",
-            ids.len(),
-            self.max_builds,
-            ids.join(", ")
-        )
+        let others = |pods: &[Pod]| -> Vec<String> {
+            pods.iter()
+                .filter_map(|p| label(p, LABEL_BUILD_ID))
+                .filter(|id| me.is_none_or(|me| me.as_str() != *id))
+                .map(str::to_string)
+                .collect()
+        };
+        if !admits(&mine, self.max_builds, me) {
+            let ids = others(&mine);
+            bail!(
+                "this sandbox has {} live builds (max {}): {}; clean one first",
+                ids.len(),
+                self.max_builds,
+                ids.join(", ")
+            )
+        }
+        if !admits(&every, self.max_builds_total, me) {
+            bail!(
+                "the namespace has {} live builds across sandboxes (max {}); clean one of yours \
+                 or retry later",
+                others(&every).len(),
+                self.max_builds_total
+            )
+        }
+        Ok(())
     }
 
     // deletes every sandbox's ended builder pods
@@ -1618,7 +1635,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use k8s_openapi::api::core::v1::Pod;
+    use k8s_openapi::api::core::v1::{Namespace, Pod, ServiceAccount};
+    use kube::Api;
+    use kube::api::{DeleteParams, PostParams};
     use rmcp::ServiceExt;
     use rmcp::model::CallToolRequestParams;
     use rmcp::transport::StreamableHttpClientTransport;
@@ -1629,7 +1648,7 @@ mod tests {
     use crate::backend::{Backend, Resources};
     use crate::mcp::{
         Broker, BuildId, BuildParams, BuildRequest, Caller, Denied, Identity, LABEL_BUILD_ID,
-        MCP_PATH, McpArgs, TokenLine, Tools, WorkspaceKind, alive, allowed_hosts, bearer,
+        MCP_PATH, McpArgs, TokenLine, Tools, WorkspaceKind, admits, alive, allowed_hosts, bearer,
         constant_time_eq, fetch_argv, from_argv, identity, kube_client, match_token, owned_by,
         parse_tokens, rm_argv, router, run_argv, selector, serve_until, step_outcome,
         unpack_fetched, within_cap, workload_owner,
@@ -2003,6 +2022,12 @@ mod tests {
         ];
         assert!(within_cap(&earlier, 1, &id("buildit-x")));
         assert!(!within_cap(&earlier, 1, &id("buildit-y")));
+
+        assert!(admits(&earlier, 3, None));
+        assert!(!admits(&earlier, 2, None));
+        assert!(admits(&earlier, 1, Some(&id("buildit-x"))));
+        assert!(!admits(&earlier, 1, Some(&id("buildit-y"))));
+        assert!(!admits(&[], 1, Some(&id("buildit-x"))));
     }
 
     #[tokio::test]
@@ -2059,6 +2084,7 @@ mod tests {
             resources: Resources::default(),
             deadline_secs: 600,
             max_builds: 2,
+            max_builds_total: 16,
             owner: None,
             calls: tokio_util::task::TaskTracker::new(),
         })
@@ -2882,19 +2908,27 @@ mod tests {
     }
 
     async fn cluster_broker(dir: &Path, tokens: &Tokens, max_builds: usize) -> Arc<Broker> {
-        cluster_broker_with_deadline(dir, tokens, max_builds, 900).await
+        cluster_broker_with(dir, tokens, &e2e_namespace(), max_builds, 16, 900).await
     }
 
-    async fn cluster_broker_with_deadline(
+    fn e2e_context() -> String {
+        std::env::var("BUILDIT_E2E_KUBECONTEXT")
+            .expect("set BUILDIT_E2E_KUBECONTEXT to a disposable cluster's context")
+    }
+
+    fn e2e_namespace() -> String {
+        std::env::var("BUILDIT_E2E_NAMESPACE").unwrap_or_else(|_| "default".to_string())
+    }
+
+    async fn cluster_broker_with(
         dir: &Path,
         tokens: &Tokens,
+        ns: &str,
         max_builds: usize,
+        max_builds_total: usize,
         deadline_secs: i64,
     ) -> Arc<Broker> {
-        let ctx = std::env::var("BUILDIT_E2E_KUBECONTEXT")
-            .expect("set BUILDIT_E2E_KUBECONTEXT to a disposable cluster's context");
-        let ns = std::env::var("BUILDIT_E2E_NAMESPACE").unwrap_or_else(|_| "default".to_string());
-        let (client, namespace, _) = kube_client(Some(&ctx), Some(&ns)).await.unwrap();
+        let (client, namespace, _) = kube_client(Some(&e2e_context()), Some(ns)).await.unwrap();
         Arc::new(Broker {
             client,
             namespace,
@@ -2904,6 +2938,7 @@ mod tests {
             resources: Resources::default(),
             deadline_secs,
             max_builds,
+            max_builds_total,
             owner: None,
             calls: tokio_util::task::TaskTracker::new(),
         })
@@ -3151,7 +3186,8 @@ mod tests {
         for sandbox in ["sb-a", "sb-b"] {
             let name = SandboxName::parse(sandbox).unwrap();
             let broker = cluster_broker(&dir, &tokens, 2).await;
-            assert!(broker.live_builds(&name).await.unwrap().is_empty());
+            let live = broker.live_builds().await.unwrap();
+            assert!(!live.iter().any(|p| owned_by(p, &name)));
         }
         let e = call_err(&a, "logs", serde_json::json!({ "build_id": id })).await;
         assert_eq!(e, format!("no live build {id}; build again"));
@@ -3159,6 +3195,66 @@ mod tests {
         a.cancel().await.unwrap();
         b.cancel().await.unwrap();
         second.shut_down().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_the_namespace_cap_counts_every_sandbox() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let tokens = Tokens::all();
+        write(
+            &dir.join("svc/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nRUN echo hi\n",
+        );
+        let (kube, _, _) = kube_client(Some(&e2e_context()), None).await.unwrap();
+        let ns = crate::pod::unique_name();
+        let namespaces: Api<Namespace> = Api::all(kube.clone());
+        let body: Namespace =
+            serde_json::from_value(serde_json::json!({ "metadata": { "name": ns } })).unwrap();
+        namespaces
+            .create(&PostParams::default(), &body)
+            .await
+            .unwrap();
+        let accounts: Api<ServiceAccount> = Api::namespaced(kube.clone(), &ns);
+        wait_until("the default service account", 60, async || {
+            accounts.get_opt("default").await.unwrap().is_some()
+        })
+        .await;
+
+        let broker = cluster_broker_with(&dir, &tokens, &ns, 4, 1, 900).await;
+        let server = start(broker.clone(), Duration::from_secs(5)).await;
+        let a = client(&server.addr, &token_for("sb-a")).await.unwrap();
+        let b = client(&server.addr, &token_for("sb-b")).await.unwrap();
+
+        let built = call_ok(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        assert_eq!(built["exit"], 0, "{built}");
+        let id = built["build_id"].as_str().unwrap().to_string();
+        let e = call_err(&b, "build", serde_json::json!({ "context": "svc" })).await;
+        assert_eq!(
+            e,
+            "the namespace has 1 live builds across sandboxes (max 1); clean one of yours or \
+             retry later"
+        );
+        assert!(!e.contains(&id), "{e}");
+        assert!(sandbox_pods(&broker, "sb-b").await.is_empty());
+        let e = call_err(&a, "build", serde_json::json!({ "context": "svc" })).await;
+        assert!(e.starts_with("the namespace has 1 live builds"), "{e}");
+
+        let cleaned = call_ok(&a, "clean", serde_json::json!({})).await;
+        assert_eq!(cleaned["deleted"], serde_json::json!([id]));
+        let other = call_ok(&b, "build", serde_json::json!({ "context": "svc" })).await;
+        assert_eq!(other["exit"], 0, "{other}");
+        call_ok(&b, "clean", serde_json::json!({})).await;
+
+        a.cancel().await.unwrap();
+        b.cancel().await.unwrap();
+        server.shut_down().await;
+        namespaces
+            .delete(&ns, &DeleteParams::default())
+            .await
+            .unwrap();
     }
 
     async fn sandbox_pods(broker: &Broker, sandbox: &str) -> Vec<Pod> {
@@ -3394,7 +3490,7 @@ mod tests {
             "FROM docker.io/library/busybox:latest\nRUN echo hi\n",
         );
         let server = start(
-            cluster_broker_with_deadline(&dir, &tokens, 2, 45).await,
+            cluster_broker_with(&dir, &tokens, &e2e_namespace(), 2, 16, 45).await,
             Duration::from_secs(5),
         )
         .await;
