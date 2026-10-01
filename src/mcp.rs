@@ -847,7 +847,7 @@ impl Broker {
             Err(e) => LogText::whole(format!("buildit: {e:#}\n").into_bytes()),
         };
         let file = log.file_name();
-        std::fs::write(results.join(&file), text.body())
+        std::fs::write(results.join(&file), text.copy())
             .with_context(|| format!("writing {file}"))?;
         summarize(&text, log, results_path(id, &file), failed)
     }

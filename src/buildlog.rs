@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -37,7 +38,7 @@ until (: > "$d/run-$n.log") 2>/dev/null; do
 done
 echo "$n""#;
 
-const STEP_SCRIPT: &str = r#"log="$1"; secs="$2"; shift 2; printf '$ %s\n' "$*" >> "$log"; exec timeout "$secs" "$@" >> "$log" 2>&1"#;
+const STEP_SCRIPT: &str = r#"log="$1"; secs="$2"; printf '$ %s\n' "$3" >> "$log"; shift 3; exec timeout "$secs" "$@" >> "$log" 2>&1"#;
 
 const NOTE_SCRIPT: &str = r#"printf '%s\n' "$2" >> "$1""#;
 
@@ -142,9 +143,14 @@ pub fn note_argv(shell: &str, log: LogName, line: &str) -> Vec<String> {
     argv(shell, NOTE_SCRIPT, &[&log.path(), line])
 }
 
-// appends `$ argv` then the command's stdout and stderr to the log
+// appends `$ argv` on one line, then the command's stdout and stderr, to the log
 pub fn step_argv(shell: &str, log: LogName, secs: u64, step: &[String]) -> Vec<String> {
-    let mut out = argv(shell, STEP_SCRIPT, &[&log.path(), &secs.max(1).to_string()]);
+    let echo = step.join(" ").replace('\r', "\\r").replace('\n', "\\n");
+    let mut out = argv(
+        shell,
+        STEP_SCRIPT,
+        &[&log.path(), &secs.max(1).to_string(), &echo],
+    );
     out.extend(step.iter().cloned());
     out
 }
@@ -201,8 +207,23 @@ impl LogText {
         })
     }
 
-    pub fn body(&self) -> &[u8] {
-        &self.body
+    pub fn unread_head_bytes(&self) -> Option<u64> {
+        (self.dropped_bytes > 0).then_some(self.dropped_bytes)
+    }
+
+    // the local copy: the bytes read, after a line saying what was dropped
+    pub fn copy(&self) -> Vec<u8> {
+        let Some(bytes) = self.unread_head_bytes() else {
+            return self.body.clone();
+        };
+        let mut out = format!(
+            "buildit: the first {bytes} bytes ({} lines) are not in this copy; it starts at line {}\n",
+            self.first_line - 1,
+            self.first_line
+        )
+        .into_bytes();
+        out.extend_from_slice(&self.body);
+        out
     }
 
     fn lines(&self) -> Vec<(u64, &[u8])> {
@@ -281,13 +302,15 @@ impl LogQuery {
     }
 
     pub fn run(&self, text: &LogText, log: LogName, available: &[LogName]) -> LogPage {
-        let lines = text.lines();
         let lo = self.from_line.unwrap_or(1);
         let hi = self.to_line.unwrap_or(u64::MAX);
-        let in_range: Vec<(u64, &[u8])> = lines
+        let cleaned: Vec<(u64, Cow<'_, [u8]>)> = text
+            .lines()
             .into_iter()
             .filter(|(n, _)| (lo..=hi).contains(n))
+            .map(|(n, line)| (n, strip_controls(line)))
             .collect();
+        let in_range: Vec<(u64, &[u8])> = cleaned.iter().map(|(n, l)| (*n, l.as_ref())).collect();
 
         let (mut entries, matched) = match &self.grep {
             None => (
@@ -361,7 +384,7 @@ impl LogQuery {
             matched,
             shown: (start < end).then(|| [entries[start].n, entries[end - 1].n]),
             truncated,
-            unread_head_bytes: (text.dropped_bytes > 0).then_some(text.dropped_bytes),
+            unread_head_bytes: text.unread_head_bytes(),
             lines: out,
         }
     }
@@ -397,9 +420,64 @@ impl Entry<'_> {
     }
 }
 
+// drops ANSI escape sequences; other control bytes but tab become spaces
+fn strip_controls(line: &[u8]) -> Cow<'_, [u8]> {
+    let control = |b: u8| (b < 0x20 && b != b'\t') || b == 0x7f;
+    if !line.iter().any(|b| control(*b)) {
+        return Cow::Borrowed(line);
+    }
+    let mut out = Vec::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        let b = line[i];
+        i += 1;
+        if b != 0x1b {
+            out.push(if control(b) { b' ' } else { b });
+            continue;
+        }
+        match line.get(i) {
+            // CSI: parameters and intermediates, then one final byte
+            Some(b'[') => {
+                i += 1;
+                while i < line.len() && !(0x40..=0x7e).contains(&line[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // OSC: ends at BEL or ESC \
+            Some(b']') => {
+                while i < line.len() && line[i] != 0x07 && line[i] != 0x1b {
+                    i += 1;
+                }
+                i += if line.get(i) == Some(&0x1b) { 2 } else { 1 };
+            }
+            // other escapes: intermediates, then one final byte
+            _ => {
+                while i < line.len() && (0x20..=0x2f).contains(&line[i]) {
+                    i += 1;
+                }
+                if i < line.len() && (0x30..=0x7e).contains(&line[i]) {
+                    i += 1;
+                }
+            }
+        }
+    }
+    Cow::Owned(out)
+}
+
+// bytes `s` takes inside a JSON string, once control bytes are stripped
+fn json_len(s: &str) -> usize {
+    s.len()
+        + s.bytes()
+            .filter(|b| matches!(b, b'"' | b'\\' | b'\t'))
+            .count()
+}
+
 // the widest window of whole lines within budget, anchored at one end
 fn fit(rendered: &[(bool, String, bool)], budget: usize, keep_end: bool) -> (usize, usize) {
-    let cost = |(gap, line, _): &(bool, String, bool)| line.len() + 1 + if *gap { 3 } else { 0 };
+    // `\n` after each line, `--\n` before a gap, as JSON escapes
+    let cost =
+        |(gap, line, _): &(bool, String, bool)| json_len(line) + 2 + if *gap { 4 } else { 0 };
     let mut used = 0;
     let mut count = 0;
     let order: Box<dyn Iterator<Item = &(bool, String, bool)>> = if keep_end {
@@ -442,6 +520,8 @@ pub struct LogSummary {
     pub log: String,
     pub path: String,
     pub total_lines: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread_head_bytes: Option<u64>,
     pub tail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<String>,
@@ -477,6 +557,7 @@ pub fn summarize(text: &LogText, log: LogName, path: String, failed: bool) -> Re
         log: log.to_string(),
         path,
         total_lines: text.total_lines(),
+        unread_head_bytes: text.unread_head_bytes(),
         tail: tail.lines,
         errors,
     })
@@ -488,7 +569,8 @@ mod tests {
 
     use crate::buildlog::{
         LIST_SCRIPT, LogName, LogQuery, LogSelector, LogText, QueryParams, alloc_run_argv,
-        list_argv, note_argv, parse_list, parse_run_number, read_argv, step_argv, summarize,
+        list_argv, note_argv, parse_list, parse_run_number, read_argv, step_argv, strip_controls,
+        summarize,
     };
 
     fn text(n: u64) -> LogText {
@@ -793,6 +875,89 @@ mod tests {
     }
 
     #[test]
+    fn control_bytes_and_ansi_escapes_are_stripped() {
+        let plain = b"plain\ttext";
+        assert!(matches!(
+            strip_controls(plain),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let cases: [(&[u8], &[u8]); 7] = [
+            (b"\x1b[31merror\x1b[0m: x", b"error: x"),
+            (b"\x1b[1;38;5;196mbold\x1b[m", b"bold"),
+            (b"\x1b]0;title\x07after", b"after"),
+            (b"\x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\", b"link"),
+            (b"10%\r20%\r", b"10% 20% "),
+            (b"a\x1b(Bb\x7fc\x00d", b"ab c d"),
+            (b"cut\x1b[", b"cut"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                strip_controls(raw).as_ref(),
+                want,
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        let t = LogText::whole(b"\x1b[31merror\x1b[0m one\nok\n".to_vec());
+        let page = run(
+            &t,
+            QueryParams {
+                grep: Some("^error one$"),
+                ..q()
+            },
+        );
+        assert_eq!(page.lines, "1:error one\n");
+    }
+
+    #[test]
+    fn max_bytes_bounds_the_json_encoded_lines() {
+        let mut body = Vec::new();
+        for _ in 0..2000 {
+            body.extend(b"\x1b[33m\"q\"\t\\path\x1b[0m \"\"\"\"\"\"\"\"\n");
+        }
+        let t = LogText::whole(body);
+        for max in [2048, 16 * 1024, 64 * 1024] {
+            let page = run(
+                &t,
+                QueryParams {
+                    max_bytes: Some(max),
+                    ..q()
+                },
+            );
+            assert!(page.truncated);
+            let encoded = serde_json::to_string(&page.lines).unwrap();
+            assert!(
+                encoded.len() <= usize::try_from(max).unwrap() + 2,
+                "{max}: {}",
+                encoded.len()
+            );
+            assert!(!encoded.contains("\\u001b"), "{encoded}");
+            assert!(encoded.len() * 10 > usize::try_from(max).unwrap() * 9);
+        }
+    }
+
+    #[test]
+    fn a_dropped_head_shows_in_the_summary_and_the_copy() {
+        let t = LogText::parse(b"120 7\npartial\nnext\n".to_vec()).unwrap();
+        let s = summarize(&t, LogName::Build, String::new(), false).unwrap();
+        assert_eq!(s.unread_head_bytes, Some(120));
+        assert_eq!(
+            String::from_utf8(t.copy()).unwrap(),
+            "buildit: the first 120 bytes (7 lines) are not in this copy; it starts at line 8\n\
+             partial\nnext\n"
+        );
+        let whole = LogText::whole(b"a\n".to_vec());
+        assert_eq!(whole.copy(), b"a\n");
+        let s = summarize(&whole, LogName::Build, String::new(), false).unwrap();
+        assert_eq!(s.unread_head_bytes, None);
+        assert!(
+            !serde_json::to_string(&s)
+                .unwrap()
+                .contains("unread_head_bytes")
+        );
+    }
+
+    #[test]
     fn read_header_offsets_line_numbers() {
         let t = LogText::parse(b"120 7\npartial\nnext\n".to_vec()).unwrap();
         assert_eq!(t.total_lines(), 9);
@@ -897,7 +1062,7 @@ mod tests {
         let out = sh(&at(read_argv("/bin/sh", LogName::Build)));
         assert!(out.status.success(), "{out:?}");
         let t = LogText::parse(out.stdout).unwrap();
-        assert_eq!(t.body(), b"hello $(id) `x`\nsecond\n");
+        assert_eq!(t.body, b"hello $(id) `x`\nsecond\n");
         assert_eq!(t.total_lines(), 2);
 
         let out = sh(&at(read_argv("/bin/sh", LogName::Run(9))));
@@ -912,8 +1077,41 @@ mod tests {
         let out = sh(&argv);
         assert!(out.status.success(), "{out:?}");
         let t = LogText::parse(out.stdout).unwrap();
-        assert_eq!(t.body(), b"l8\nl9\nl10\n");
+        assert_eq!(t.body, b"l8\nl9\nl10\n");
         assert_eq!(t.total_lines(), 10);
+    }
+
+    // needs `timeout` on PATH
+    #[test]
+    fn step_echo_is_one_line_so_scripts_are_not_read_as_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let script = "echo 'is undefined: x'\n# error in a comment\nexit 3".to_string();
+        let argv = rebase(
+            step_argv(
+                "/bin/sh",
+                LogName::Run(1),
+                30,
+                &["sh".to_string(), "-c".to_string(), script],
+            ),
+            "/buildit/logs",
+            d,
+        );
+        let out = sh(&argv);
+        assert_eq!(out.status.code(), Some(3), "{out:?}");
+        let log = std::fs::read_to_string(dir.path().join("run-1.log")).unwrap();
+        assert_eq!(
+            log,
+            "$ sh -c echo 'is undefined: x'\\n# error in a comment\\nexit 3\nis undefined: x\n"
+        );
+        let s = summarize(
+            &LogText::whole(log.into_bytes()),
+            LogName::Run(1),
+            String::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.errors.as_deref(), Some("2:is undefined: x\n"));
     }
 
     #[test]
@@ -936,6 +1134,7 @@ mod tests {
                 "sh",
                 "/buildit/logs/run-2.log",
                 "1",
+                "buildah run c; rm -rf /",
                 "buildah",
                 "run",
                 "c; rm -rf /"
