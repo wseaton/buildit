@@ -43,11 +43,15 @@ const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SUMMARY_LINES: usize = 40;
 const SUMMARY_BYTES: usize = 8 * 1024;
 const SUMMARY_WINDOW: u64 = 256 * 1024;
+const TIMEOUT_EXIT: i32 = 124;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
 // appends `$ argv`, then the command's stdout and stderr, to the log
 const STEP_SCRIPT: &str = r#"log="$1"; secs="$2"; shift 2; mkdir -p "${log%/*}"; printf '$ %s\n' "$*" >> "$log"; exec timeout "$secs" "$@" >> "$log" 2>&1"#;
+// STEP_SCRIPT in the background; writes its pid, then its exit code when done
+const LAUNCH_SCRIPT: &str = r#"log="$1"; exit_file="$2"; pid_file="$3"; secs="$4"; shift 4; mkdir -p "${log%/*}"; printf '$ %s\n' "$*" >> "$log"; { timeout "$secs" "$@" >> "$log" 2>&1; echo "$?" > "$exit_file.tmp"; mv "$exit_file.tmp" "$exit_file"; } < /dev/null > /dev/null 2>&1 & echo "$!" > "$pid_file""#;
+const STATE_SCRIPT: &str = r#"if [ -f "$1" ]; then echo "exit $(cat "$1")"; elif kill -0 "$(cat "$2" 2>/dev/null)" 2>/dev/null; then echo running; else echo lost; fi"#;
 const ALLOC_SCRIPT: &str = r#"set -C; n=1; until : > "$1/run-$n.log"; do n=$((n + 1)); [ "$n" -le 9999 ] || exit 1; done 2>/dev/null; echo "$n""#;
 const FETCH_SCRIPT: &str = r#"ctr="$1"; shift; mnt=$(buildah mount "$ctr") || exit 1; cd "$mnt" || exit 1; exec tar -cf - --ignore-failed-read -- "$@""#;
 
@@ -251,6 +255,7 @@ pub struct BuildParams {
     /// Dockerfile path relative to the context (default "Dockerfile")
     pub dockerfile: Option<String>,
     /// Multi-stage target to stop at
+    #[serde(alias = "build_target")]
     pub target: Option<String>,
     /// Build args, NAME -> value
     #[serde(default)]
@@ -260,8 +265,14 @@ pub struct BuildParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatusParams {
+    /// build_id from build
+    pub build_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunParams {
-    /// build_id returned by a successful build
+    /// build_id of a build whose status is succeeded
     pub build_id: String,
     /// argv to run in a fresh container of the built image; use ["sh", "-c", "..."] for a shell
     pub cmd: Vec<String>,
@@ -298,9 +309,60 @@ pub struct CleanParams {
     pub build_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildState {
+    Running,
+    Exited(i32),
+    Lost,
+}
+
+impl BuildState {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "running" => Ok(Self::Running),
+            "lost" => Ok(Self::Lost),
+            other => other
+                .strip_prefix("exit ")
+                .and_then(|code| code.parse().ok())
+                .map(Self::Exited)
+                .ok_or_else(|| anyhow!("unexpected build state {other:?}")),
+        }
+    }
+
+    fn status(self) -> BuildStatus {
+        match self {
+            Self::Running => BuildStatus::Running,
+            Self::Exited(0) => BuildStatus::Succeeded,
+            Self::Exited(_) | Self::Lost => BuildStatus::Failed,
+        }
+    }
+
+    fn exit(self) -> Option<i32> {
+        match self {
+            Self::Exited(code) => Some(code),
+            Self::Running | Self::Lost => None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct BuildReply {
     pub build_id: String,
+    pub status: BuildStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusReply {
+    pub build_id: String,
+    pub status: BuildStatus,
     pub exit: Option<i32>,
     pub timed_out: bool,
     pub log_tail: String,
@@ -386,6 +448,29 @@ async fn step(pod: &BuilderPod, log: LogName, limit: Duration, cmd: &[String]) -
         exit: Some(code),
         timed_out: code != 0 && started.elapsed() >= limit,
     })
+}
+
+fn build_file(name: &str) -> String {
+    format!("{LOG_DIR}/build.{name}")
+}
+
+async fn launch(pod: &BuilderPod, limit: Duration, cmd: &[String]) -> Result<()> {
+    let mut sh = argv(["sh", "-c", LAUNCH_SCRIPT, "sh"]);
+    sh.extend([
+        LogName::Build.path(),
+        build_file("exit"),
+        build_file("pid"),
+        limit.as_secs().to_string(),
+    ]);
+    sh.extend_from_slice(cmd);
+    pod.exec_capture(&sh).await?;
+    Ok(())
+}
+
+async fn build_state(pod: &BuilderPod) -> Result<BuildState> {
+    let mut sh = argv(["sh", "-c", STATE_SCRIPT, "sh"]);
+    sh.extend([build_file("exit"), build_file("pid")]);
+    BuildState::parse(&pod.exec_capture(&sh).await?)
 }
 
 async fn log_tail(pod: &BuilderPod, log: LogName) -> Result<String> {
@@ -591,13 +676,10 @@ impl Broker {
             pod.exec_capture(&Backend::Buildah.setup_command()).await?;
             pod.exec_with_stdin(&Backend::Buildah.untar_command(), &tarball)
                 .await?;
-            let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
-            let outcome = step(&pod, LogName::Build, limit, &bud).await?;
+            launch(&pod, timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S), &bud).await?;
             Ok(BuildReply {
                 build_id: id.0.clone(),
-                exit: outcome.exit,
-                timed_out: outcome.timed_out,
-                log_tail: log_tail(&pod, LogName::Build).await?,
+                status: BuildStatus::Running,
             })
         }
         .await;
@@ -607,6 +689,19 @@ impl Broker {
             tracing::warn!("deleting builder pod {}: {e:#}", id.0);
         }
         built
+    }
+
+    pub async fn status(&self, sandbox: &SandboxName, p: StatusParams) -> Result<StatusReply> {
+        let id = BuildId::parse(&p.build_id)?;
+        let pod = self.find(sandbox, &id).await?;
+        let state = build_state(&pod).await?;
+        Ok(StatusReply {
+            build_id: id.0,
+            status: state.status(),
+            exit: state.exit(),
+            timed_out: state == BuildState::Exited(TIMEOUT_EXIT),
+            log_tail: log_tail(&pod, LogName::Build).await?,
+        })
     }
 
     pub async fn run(&self, caller: &Caller, p: RunParams) -> Result<RunReply> {
@@ -620,6 +715,15 @@ impl Broker {
             .map(|f| RelPath::parse(f.trim_start_matches('/')))
             .collect::<Result<Vec<_>>>()?;
         let pod = self.find(&caller.sandbox, &id).await?;
+        match build_state(&pod).await? {
+            BuildState::Exited(0) => {}
+            BuildState::Running => bail!("build {} is still building; poll status", id.0),
+            state => bail!(
+                "build {} failed (exit {}); read its logs, then clean",
+                id.0,
+                state.exit().map_or("none".to_string(), |c| c.to_string())
+            ),
+        }
         let alloc = pod
             .exec_capture(&argv(["sh", "-c", ALLOC_SCRIPT, "sh", LOG_DIR]))
             .await?;
@@ -739,9 +843,9 @@ fn reply<T: Serialize>(result: Result<T>) -> Result<String, String> {
 #[tool_router]
 impl BuilditMcp {
     #[tool(
-        description = "Build a Dockerfile from a workspace subdirectory on a remote builder; pushes \
-        nothing. Returns build_id, exit and the log's last lines. The builder stays up \
-        for `run` and `logs` until `clean`."
+        description = "Start building a Dockerfile (params: context, dockerfile, target, build_args, \
+        timeout_s); pushes nothing. Returns build_id with status running at once. Poll `status` \
+        until succeeded or failed, then `run`/`logs` as needed, and always `clean` the build_id."
     )]
     async fn build(
         &self,
@@ -752,7 +856,20 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Run a command in a fresh container of a successful build. Returns exit, the \
+        description = "Report a build's status (params: build_id): running, succeeded or failed, \
+        with exit, timed_out and the build log's last lines. Poll it after `build`; `clean` when done."
+    )]
+    async fn status(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<StatusParams>,
+    ) -> Result<String, String> {
+        reply(async { self.broker.status(&caller(&parts)?.sandbox, p).await }.await)
+    }
+
+    #[tool(
+        description = "Run a command (params: build_id, cmd, timeout_s, fetch_paths) in a fresh \
+        container of a build whose status is succeeded. Returns exit, the \
         log name (run:<n>) and its last lines; fetch_paths are copied out of the container into \
         .buildit/<build_id>/<path>."
     )]
@@ -765,8 +882,8 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Read part of a build or run log, as numbered lines: grep with optional \
-        context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
+        description = "Read part of a build or run log (params: build_id, which, grep, context, \
+        from_line, to_line, tail_lines, max_bytes), as numbered lines: grep with optional context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
         total_lines and matched; output is capped at max_bytes and long lines are clipped. \
         When output overflows max_bytes, tail and grep keep the newest lines (the end of the \
         log) and range keeps the first; truncated is set. \
@@ -781,7 +898,10 @@ impl BuilditMcp {
         reply(async { self.broker.logs(&caller(&parts)?.sandbox, p).await }.await)
     }
 
-    #[tool(description = "Delete a build's builder pod, or all of this sandbox's builds.")]
+    #[tool(
+        description = "Delete a build's builder pod (params: build_id), or all of this sandbox's \
+        builds when build_id is omitted. Call it once done with a build, succeeded or not."
+    )]
     async fn clean(
         &self,
         Extension(parts): Extension<Parts>,
@@ -811,8 +931,8 @@ mod tests {
 
     use crate::backend::Resources;
     use crate::mcp::{
-        Broker, BuildId, Caller, LogsParams, MCP_PATH, TokenLine, bud_argv, parse_tokens, router,
-        unpack,
+        Broker, BuildId, BuildParams, BuildState, BuildStatus, Caller, LogsParams, MCP_PATH,
+        TokenLine, bud_argv, parse_tokens, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
 
@@ -955,7 +1075,13 @@ mod tests {
         assert_eq!(status, 200, "{reply}");
         assert!(reply.contains("content-type: application/json"), "{reply}");
         assert!(!reply.contains("mcp-session-id"), "{reply}");
-        for tool in ["\"build\"", "\"run\"", "\"logs\"", "\"clean\""] {
+        for tool in [
+            "\"build\"",
+            "\"status\"",
+            "\"run\"",
+            "\"logs\"",
+            "\"clean\"",
+        ] {
             assert!(reply.contains(tool), "{tool}: {reply}");
         }
         for host in ["host.openshell.internal:8849", "builds.svc"] {
@@ -992,6 +1118,66 @@ mod tests {
         for v in bad {
             assert!(params(v.clone()).query().is_err(), "{v}");
         }
+    }
+
+    #[test]
+    fn build_target_is_an_alias_of_target() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
+        for key in ["target", "build_target"] {
+            let p = parse(serde_json::json!({ "context": "svc", key: "base" })).unwrap();
+            assert_eq!(p.target.as_deref(), Some("base"), "{key}");
+        }
+        let p = parse(serde_json::json!({ "context": "svc" })).unwrap();
+        assert_eq!(p.target, None);
+        let both = serde_json::json!({ "context": "svc", "target": "a", "build_target": "b" });
+        assert!(parse(both).is_err());
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
+        assert!(schema["properties"]["target"].is_object(), "{schema}");
+        assert_ne!(schema["additionalProperties"], false, "{schema}");
+    }
+
+    #[test]
+    fn build_states_parse_from_the_state_script() {
+        let cases = [
+            ("running\n", BuildState::Running, BuildStatus::Running, None),
+            (
+                "exit 0\n",
+                BuildState::Exited(0),
+                BuildStatus::Succeeded,
+                Some(0),
+            ),
+            (
+                "exit 1",
+                BuildState::Exited(1),
+                BuildStatus::Failed,
+                Some(1),
+            ),
+            (
+                "exit 124\n",
+                BuildState::Exited(124),
+                BuildStatus::Failed,
+                Some(124),
+            ),
+            ("lost\n", BuildState::Lost, BuildStatus::Failed, None),
+        ];
+        for (raw, state, status, exit) in cases {
+            let parsed = BuildState::parse(raw).unwrap();
+            assert_eq!(parsed, state, "{raw:?}");
+            assert_eq!(parsed.status(), status, "{raw:?}");
+            assert_eq!(parsed.exit(), exit, "{raw:?}");
+        }
+        for bad in ["", "exit ", "exit x", "exit 1 2", "Running", "done"] {
+            assert!(BuildState::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            serde_json::to_value([
+                BuildStatus::Running,
+                BuildStatus::Succeeded,
+                BuildStatus::Failed
+            ])
+            .unwrap(),
+            serde_json::json!(["running", "succeeded", "failed"])
+        );
     }
 
     #[test]
@@ -1106,7 +1292,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
-    async fn e2e_build_restart_run_fetch_logs_and_clean() {
+    async fn e2e_build_poll_restart_run_fetch_logs_and_clean() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1115,7 +1301,7 @@ mod tests {
         std::fs::write(
             work.join("svc/Dockerfile"),
             "FROM docker.io/library/busybox:latest AS base\n\
-             RUN echo hello-from-build && mkdir -p /out && echo artifact > /out/a.txt\n\
+             RUN echo hello-from-build && sleep 20 && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS broken\n\
              RUN exit 1\n",
         )
@@ -1127,18 +1313,57 @@ mod tests {
         };
 
         let (addr, first) = serve(cluster().await).await;
-        let args = serde_json::json!({ "context": "svc", "target": "base" });
+        let args = serde_json::json!({ "context": "svc", "build_target": "base" });
         let built = call(&addr, "tok-a", "build", args).await.unwrap();
-        assert_eq!(built["exit"], 0, "{built}");
-        let tail = built["log_tail"].as_str().unwrap();
-        assert!(tail.contains("hello-from-build"), "{built}");
+        assert_eq!(built["status"], "running", "{built}");
         let id = built["build_id"].as_str().unwrap().to_string();
+        let args = serde_json::json!({ "context": "svc", "target": "broken" });
+        let broken = call(&addr, "tok-a", "build", args).await.unwrap();
+        assert_eq!(broken["status"], "running", "{broken}");
+        let broken = broken["build_id"].as_str().unwrap().to_string();
+
+        let only_id = serde_json::json!({ "build_id": id });
+        let status = call(&addr, "tok-a", "status", only_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "running", "{status}");
+        assert_eq!(status["exit"], serde_json::Value::Null, "{status}");
+        let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
+        let e = call(&addr, "tok-a", "run", run).await.unwrap_err();
+        assert!(e.contains("still building"), "{e}");
         first.abort();
 
-        // a new server process with no memory of the build
+        // a new server process with no memory of the builds
         let (addr, _second) = serve(cluster().await).await;
         let a = |tool, args| call(&addr, "tok-a", tool, args);
         let b = |tool, args| call(&addr, "tok-b", tool, args);
+        let finished = |build_id: String| {
+            let addr = addr.clone();
+            async move {
+                let args = serde_json::json!({ "build_id": build_id });
+                for _ in 0..150 {
+                    let status = call(&addr, "tok-a", "status", args.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        return status;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {build_id} still running after 300s");
+            }
+        };
+        let done = finished(id.clone()).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["exit"], 0, "{done}");
+        assert_eq!(done["timed_out"], false, "{done}");
+        let tail = done["log_tail"].as_str().unwrap();
+        assert!(tail.contains("hello-from-build"), "{done}");
+        let failed = finished(broken.clone()).await;
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_ne!(failed["exit"], 0, "{failed}");
+        assert!(failed["exit"].is_i64(), "{failed}");
+        let run = serde_json::json!({ "build_id": broken, "cmd": ["true"] });
+        let e = a("run", run).await.unwrap_err();
+        assert!(e.contains("failed (exit"), "{e}");
         let args = serde_json::json!({
             "build_id": id,
             "cmd": ["sh", "-c", "echo out-1; exit 5"],
@@ -1184,17 +1409,26 @@ mod tests {
         let args = serde_json::json!({ "build_id": id, "which": "run:2" });
         assert!(a("logs", args).await.is_err());
 
-        let only_id = serde_json::json!({ "build_id": id });
         let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
-        for (tool, args) in [("run", run), ("logs", only_id.clone())] {
+        for (tool, args) in [
+            ("run", run),
+            ("logs", only_id.clone()),
+            ("status", only_id.clone()),
+        ] {
             let e = b(tool, args).await.unwrap_err();
             assert!(e.contains("no live build"), "{tool}: {e}");
         }
         let cleaned = b("clean", only_id.clone()).await.unwrap();
         assert_eq!(cleaned["deleted"], serde_json::json!([]));
+        let cleaned = a("clean", serde_json::json!({ "build_id": broken }))
+            .await
+            .unwrap();
+        assert_eq!(cleaned["deleted"], serde_json::json!([broken]));
         let cleaned = a("clean", serde_json::json!({})).await.unwrap();
         assert_eq!(cleaned["deleted"], serde_json::json!([id]));
-        let e = a("logs", only_id).await.unwrap_err();
-        assert!(e.contains("no live build"), "{e}");
+        for tool in ["logs", "status"] {
+            let e = a(tool, only_id.clone()).await.unwrap_err();
+            assert!(e.contains("no live build"), "{tool}: {e}");
+        }
     }
 }

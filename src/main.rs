@@ -42,7 +42,7 @@ enum Cmd {
         #[arg(long)]
         kubecontext: Option<String>,
     },
-    /// Serve build/run/logs/clean as stateless MCP tools over streamable http
+    /// Serve build/status/run/logs/clean as stateless MCP tools over streamable http
     Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {

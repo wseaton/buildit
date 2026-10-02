@@ -128,10 +128,14 @@ and content-addressed; prune with your registry's lifecycle policy.
 
 ## MCP server
 
-`buildit mcp` serves `build`, `run`, `logs`, and `clean` as MCP tools over
-stateless streamable http, for agents in sandboxes that can't build images.
-`build` downloads a workspace subdirectory from the caller's sandbox and
-builds it with buildah, optionally to a `target` stage, without pushing. `run`
+`buildit mcp` serves `build`, `status`, `run`, `logs`, and `clean` as MCP
+tools over stateless streamable http, for agents in sandboxes that can't build
+images. `build` downloads a workspace subdirectory from the caller's sandbox,
+starts a buildah build of it in a builder pod, optionally to a `target` stage
+(`build_target` is accepted too), without pushing, and returns its `build_id`
+while the build runs on in the pod. `status` reports `running`, `succeeded` or
+`failed` with the exit code and the end of the build log; poll it, then `run`
+a succeeded build and `clean` it when done. `run`
 runs a command in a fresh container of the image and copies `fetch_paths`
 back to `.buildit/<build_id>/` in the sandbox. `logs` reads the newest 4 MiB
 of a build or run log from the builder pod and queries it in the server, one
