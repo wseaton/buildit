@@ -48,11 +48,14 @@ buildit build quay.io/acme/foo:tag \
   --request cpu=4 --request memory=8Gi --limit memory=16Gi \
   --label team=infra                               # builder resources + image labels
 buildit build quay.io/acme/foo:tag --output render # print manifests, touch nothing
+buildit build localhost/foo:dev --target base --no-push   # build one stage, push nothing
 buildit clean                                      # delete leftover builder pods/jobs
 ```
 
 The last stdout line is the digest-pinned ref (`repo@sha256:...`), everything
 else goes to stderr, so `$(buildit build ... | tail -1)` is scriptable.
+`--no-push` (pod mode only) prints nothing to stdout and ships registry
+credentials only if `~/.docker/config.json` has them.
 Logging is `tracing`-based; set `RUST_LOG` (e.g. `RUST_LOG=debug` for kube
 client internals) to adjust verbosity.
 
@@ -134,8 +137,12 @@ images. `build` downloads a workspace subdirectory from the caller's sandbox,
 starts a buildah build of it in a builder pod, optionally to a `target` stage
 (`build_target` is accepted too), without pushing, and returns its `build_id`
 while the build runs on in the pod. `status` reports `running`, `succeeded` or
-`failed` with the exit code and the end of the build log; poll it, then `run`
-a succeeded build and `clean` it when done. `run`
+`failed` with the exit code, `timed_out`, and the end of the build log; poll
+it, then `run` a succeeded build and `clean` it when done. The build's
+`timeout_s` is capped to end before the pod deadline. A pod that has ended
+still reports its build: the last recorded exit, else `failed` (`timed_out`
+when the pod hit its deadline), with the build log read from the container
+log. `run`
 runs a command in a fresh container of the image and copies `fetch_paths`
 back to `.buildit/<build_id>/` in the sandbox. `logs` reads the newest 4 MiB
 of a build or run log from the builder pod and queries it in the server, one

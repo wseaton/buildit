@@ -152,6 +152,8 @@ impl Backend {
         &self,
         image: &str,
         dockerfile: &str,
+        target: Option<&str>,
+        push: bool,
         build_args: &[String],
         labels: &[(String, String)],
     ) -> Vec<Vec<String>> {
@@ -170,10 +172,14 @@ impl Backend {
                     "--opt".to_string(),
                     format!("filename={dockerfile}"),
                     "--output".to_string(),
-                    format!("type=image,name={image},push=true"),
+                    format!("type=image,name={image},push={push}"),
                     "--metadata-file".to_string(),
                     self.digest_path().to_string(),
                 ];
+                if let Some(t) = target {
+                    build.push("--opt".to_string());
+                    build.push(format!("target={t}"));
+                }
                 for arg in build_args {
                     build.push("--opt".to_string());
                     build.push(format!("build-arg:{arg}"));
@@ -193,6 +199,12 @@ impl Backend {
                     // no --cleanup: it nukes the fs, digest file and all
                     format!("--digest-file={}", self.digest_path()),
                 ];
+                if let Some(t) = target {
+                    exec.push(format!("--target={t}"));
+                }
+                if !push {
+                    exec.push("--no-push".to_string());
+                }
                 for arg in build_args {
                     exec.push(format!("--build-arg={arg}"));
                 }
@@ -210,6 +222,10 @@ impl Backend {
                     "--authfile".to_string(),
                     self.auth_path().to_string(),
                 ];
+                if let Some(t) = target {
+                    bud.push("--target".to_string());
+                    bud.push(t.to_string());
+                }
                 for arg in build_args {
                     bud.push("--build-arg".to_string());
                     bud.push(arg.clone());
@@ -225,6 +241,9 @@ impl Backend {
                     image.to_string(),
                     ws.to_string(),
                 ]);
+                if !push {
+                    return vec![bud];
+                }
                 let push = vec![
                     "buildah".to_string(),
                     "push".to_string(),
@@ -455,15 +474,21 @@ impl Backend {
         &self,
         image: &str,
         dockerfile: &str,
+        target: Option<&str>,
         build_args: &[String],
         labels: &[(String, String)],
     ) -> serde_json::Value {
         let df = format!("/workspace/{dockerfile}");
         let mut container = match self {
             Backend::Buildkit => {
-                let mut args: String = build_args
-                    .iter()
-                    .map(|a| format!(" --opt build-arg:{}", shell_quote(a)))
+                let mut args: String = target
+                    .map(|t| format!(" --opt {}", shell_quote(&format!("target={t}"))))
+                    .into_iter()
+                    .chain(
+                        build_args
+                            .iter()
+                            .map(|a| format!(" --opt build-arg:{}", shell_quote(a))),
+                    )
                     .collect();
                 for (k, v) in labels {
                     args.push_str(&format!(
@@ -509,6 +534,9 @@ impl Backend {
                     format!("--destination={image}"),
                     "--digest-file=/dev/termination-log".to_string(),
                 ];
+                if let Some(t) = target {
+                    command.push(format!("--target={t}"));
+                }
                 for arg in build_args {
                     command.push(format!("--build-arg={arg}"));
                 }
@@ -522,9 +550,14 @@ impl Backend {
                 })
             }
             Backend::Buildah => {
-                let mut args: String = build_args
-                    .iter()
-                    .map(|a| format!(" --build-arg {}", shell_quote(a)))
+                let mut args: String = target
+                    .map(|t| format!(" --target {}", shell_quote(t)))
+                    .into_iter()
+                    .chain(
+                        build_args
+                            .iter()
+                            .map(|a| format!(" --build-arg {}", shell_quote(a))),
+                    )
                     .collect();
                 for (k, v) in labels {
                     args.push_str(&format!(" --label {}", shell_quote(&format!("{k}={v}"))));
@@ -575,8 +608,13 @@ impl Backend {
         namespace: &str,
         args: &crate::job::DetachArgs<'_>,
     ) -> Result<Job> {
-        let mut builder =
-            self.job_builder_container(args.image, args.dockerfile, args.build_args, args.labels);
+        let mut builder = self.job_builder_container(
+            args.image,
+            args.dockerfile,
+            args.target,
+            args.build_args,
+            args.labels,
+        );
         if let Some(res) = args.resources.json() {
             builder["resources"] = res;
         }
@@ -694,6 +732,8 @@ mod tests {
         let steps = Backend::Buildkit.build_steps(
             "quay.io/acme/foo:tag",
             "Dockerfile.tap",
+            None,
+            true,
             &["FOO=bar".to_string()],
             &[("quay.expires-after".to_string(), "1d".to_string())],
         );
@@ -711,6 +751,8 @@ mod tests {
         let steps = Backend::Kaniko.build_steps(
             "quay.io/acme/foo:tag",
             "Dockerfile.tap",
+            None,
+            true,
             &["FOO=bar".to_string()],
             &[("team".to_string(), "infra".to_string())],
         );
@@ -729,6 +771,8 @@ mod tests {
         let steps = Backend::Buildah.build_steps(
             "quay.io/acme/foo:tag",
             "Dockerfile",
+            None,
+            true,
             &[],
             &[("team".to_string(), "infra".to_string())],
         );
@@ -741,6 +785,83 @@ mod tests {
         );
         assert!(steps[1].contains(&"--digestfile".to_string()));
         assert!(steps[0].contains(&"team=infra".to_string()));
+    }
+
+    #[test]
+    fn build_steps_stop_at_the_target_and_skip_the_push() {
+        let steps = |backend: Backend, target, push| {
+            backend.build_steps("quay.io/acme/foo:tag", "Dockerfile", target, push, &[], &[])
+        };
+        for backend in [Backend::Buildkit, Backend::Kaniko, Backend::Buildah] {
+            let all = steps(backend, None, true).concat().join(" ");
+            assert!(!all.contains("target"), "{backend:?}: {all}");
+            assert!(!all.contains("--no-push"), "{backend:?}: {all}");
+        }
+
+        let buildkit = steps(Backend::Buildkit, Some("base"), false);
+        assert_eq!(buildkit.len(), 1);
+        let argv = &buildkit[0];
+        let opt = argv.iter().position(|a| a == "target=base").unwrap();
+        assert_eq!(argv[opt - 1], "--opt");
+        assert!(argv.contains(&"type=image,name=quay.io/acme/foo:tag,push=false".to_string()));
+        assert!(!argv.iter().any(|a| a.contains("push=true")), "{argv:?}");
+
+        let kaniko = steps(Backend::Kaniko, Some("base"), false);
+        assert_eq!(kaniko.len(), 1);
+        assert!(kaniko[0].contains(&"--target=base".to_string()));
+        assert!(kaniko[0].contains(&"--no-push".to_string()));
+        let pushed = steps(Backend::Kaniko, Some("base"), true);
+        assert!(!pushed[0].contains(&"--no-push".to_string()));
+
+        let buildah = steps(Backend::Buildah, Some("base"), false);
+        assert_eq!(buildah.len(), 1, "no push step: {buildah:?}");
+        let bud = &buildah[0];
+        assert_eq!(bud[..2], ["buildah".to_string(), "bud".to_string()]);
+        let t = bud.iter().position(|a| a == "--target").unwrap();
+        assert_eq!(bud[t + 1], "base");
+        let pushed = steps(Backend::Buildah, Some("base"), true);
+        assert_eq!(pushed.len(), 2);
+        assert!(pushed[0].contains(&"--target".to_string()));
+    }
+
+    #[test]
+    fn job_builds_stop_at_the_target() {
+        for (backend, want) in [
+            (Backend::Buildkit, "--opt 'target=base'"),
+            (Backend::Kaniko, "--target=base"),
+            (Backend::Buildah, "--target 'base'"),
+        ] {
+            let resources = Resources::default();
+            let args = |target| crate::job::DetachArgs {
+                image: "quay.io/acme/foo:tag",
+                dockerfile: "Dockerfile",
+                target,
+                build_args: &[],
+                ctx_ref: "quay.io/acme/foo:buildit-ctx-deadbeef0123",
+                authfile: b"",
+                idle_nodes: &[],
+                resources: &resources,
+                labels: &[],
+                cache: None,
+                node: None,
+            };
+            let cmd = |target| {
+                let job = backend
+                    .job_spec("buildit-abc123", "builds", &args(target))
+                    .unwrap();
+                job.spec.unwrap().template.spec.unwrap().containers[0]
+                    .command
+                    .as_deref()
+                    .unwrap_or_default()
+                    .join(" ")
+            };
+            assert!(
+                cmd(Some("base")).contains(want),
+                "{backend:?}: {}",
+                cmd(Some("base"))
+            );
+            assert!(!cmd(None).contains("target"), "{backend:?}: {}", cmd(None));
+        }
     }
 
     #[test]
@@ -766,6 +887,7 @@ mod tests {
                     &crate::job::DetachArgs {
                         image: "quay.io/acme/foo:tag",
                         dockerfile: "Dockerfile",
+                        target: None,
                         build_args: &["FOO=bar".to_string()],
                         ctx_ref: "quay.io/acme/foo:buildit-ctx-deadbeef0123",
                         authfile: b"",

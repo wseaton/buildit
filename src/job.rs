@@ -17,6 +17,7 @@ use crate::{auth, oci, pod};
 pub struct DetachArgs<'a> {
     pub image: &'a str,
     pub dockerfile: &'a str,
+    pub target: Option<&'a str>,
     pub build_args: &'a [String],
     pub ctx_ref: &'a str,
     pub authfile: &'a [u8],

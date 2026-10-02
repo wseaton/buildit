@@ -2,7 +2,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, AttachParams, AttachedProcess, DeleteParams, ListParams, PostParams};
+use kube::api::{
+    Api, AttachParams, AttachedProcess, DeleteParams, ListParams, LogParams, PostParams,
+};
 use kube::runtime::wait::{await_condition, conditions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -209,6 +211,13 @@ impl BuilderPod {
             stderr,
             code: Some(self.exit_code(attached).await?),
         })
+    }
+
+    pub async fn container_log(&self) -> Result<String> {
+        self.pods
+            .logs(&self.name, &LogParams::default())
+            .await
+            .with_context(|| format!("reading the logs of pod {}", self.name))
     }
 
     pub async fn delete(&self) -> Result<()> {
