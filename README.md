@@ -133,8 +133,13 @@ stateless streamable http, for agents in sandboxes that can't build images.
 `build` downloads a workspace subdirectory from the caller's sandbox and
 builds it with buildah, optionally to a `target` stage, without pushing. `run`
 runs a command in a fresh container of the image and copies `fetch_paths`
-back to `.buildit/<build_id>/` in the sandbox. `logs` greps, slices, or tails
-a build or run log inside the builder pod. `clean` deletes builder pods.
+back to `.buildit/<build_id>/` in the sandbox. `logs` reads the newest 4 MiB
+of a build or run log from the builder pod and queries it in the server, one
+of `grep` (a Rust regex, with up to 20 lines of `context`), a
+`from_line`/`to_line` range, or the last `tail_lines` (default 100). Output is
+numbered lines capped at `max_bytes` (default 16 KiB, max 64 KiB); on
+overflow, grep and tail keep the end of the log and range keeps its start.
+`clean` deletes builder pods.
 
 Callers are identified by the bearer token alone: `MCP_TOKENS_FILE` holds
 `<token> <sandbox> [<workdir>]` lines (a missing workdir falls back to

@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::pod::BuilderPod;
 
 pub const LOG_DIR: &str = "/tmp/buildit-logs";
-const MAX_READ: u64 = 4 * 1024 * 1024;
+pub const MAX_READ: u64 = 4 * 1024 * 1024;
 const LINE_CAP: usize = 1024;
 const REGEX_SIZE: usize = 1024 * 1024;
 const MAX_CONTEXT: usize = 20;
@@ -81,21 +81,21 @@ pub struct Log {
 }
 
 impl Log {
-    pub async fn fetch(pod: &BuilderPod, name: LogName) -> Result<Self> {
-        let read = (MAX_READ + 1).to_string();
+    pub async fn fetch(pod: &BuilderPod, name: LogName, window: u64) -> Result<Self> {
+        let read = (window + 1).to_string();
         let argv = ["tail", "-c", &read, "--", &name.path()].map(String::from);
-        let out = pod.exec_output(&argv, MAX_READ + 1).await?;
+        let out = pod.exec_output(&argv, window + 1).await?;
         if out.code != Some(0) {
             bail!(
                 "reading the {name} log: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(Self::from_bytes(out.stdout))
+        Ok(Self::from_bytes(out.stdout, window))
     }
 
-    fn from_bytes(mut bytes: Vec<u8>) -> Self {
-        let truncated_head = bytes.len() as u64 > MAX_READ;
+    fn from_bytes(mut bytes: Vec<u8>, window: u64) -> Self {
+        let truncated_head = bytes.len() as u64 > window;
         if truncated_head {
             let cut = bytes
                 .iter()
@@ -110,45 +110,59 @@ impl Log {
     }
 
     pub fn query(&self, query: &Query, max_bytes: usize) -> Page {
-        let lines: Vec<&str> = self.text.lines().collect();
-        let total = lines.len();
-        let (picks, matched): (Vec<(usize, bool)>, usize) = match query {
+        let total = self.text.lines().count();
+        let mut out = Budget::new(max_bytes);
+        let matched = match query {
             Query::Tail { lines: n } => {
-                let picks: Vec<_> = (total.saturating_sub(*n)..total)
-                    .map(|i| (i, true))
-                    .collect();
-                let n = picks.len();
-                (picks, n)
+                let picks = (*n).min(total);
+                let numbered = (0..total).rev().zip(self.text.lines().rev());
+                for (i, line) in numbered.take(picks) {
+                    if !out.push(render(i, ':', line)) {
+                        break;
+                    }
+                }
+                out.reverse();
+                picks
             }
             Query::Range { from, to } => {
-                let end = to.unwrap_or(total).min(total);
-                let picks: Vec<_> = (from.max(&1) - 1..end).map(|i| (i, true)).collect();
-                let n = picks.len();
-                (picks, n)
+                let start = from.max(&1) - 1;
+                let picks = to.unwrap_or(total).min(total).saturating_sub(start);
+                let numbered = self.text.lines().enumerate().skip(start);
+                for (i, line) in numbered.take(picks) {
+                    if !out.push(render(i, ':', line)) {
+                        break;
+                    }
+                }
+                picks
             }
             Query::Grep { pattern, context } => {
-                let hits: Vec<bool> = lines.iter().map(|l| pattern.is_match(l)).collect();
-                let mut keep = vec![false; total];
-                for (i, _) in hits.iter().enumerate().filter(|(_, hit)| **hit) {
-                    let hi = (i + context + 1).min(total);
-                    keep[i.saturating_sub(*context)..hi].fill(true);
+                let hits: Vec<bool> = self.text.lines().map(|l| pattern.is_match(l)).collect();
+                let mut next_hit = None;
+                let mut next_kept: Option<usize> = None;
+                let numbered = (0..total).rev().zip(self.text.lines().rev());
+                for (i, line) in numbered {
+                    if hits[i] {
+                        next_hit = Some(i);
+                    }
+                    let kept = next_hit.is_some_and(|h| h - i <= *context)
+                        || hits[i.saturating_sub(*context)..i].contains(&true);
+                    if !kept {
+                        continue;
+                    }
+                    let mut row = render(i, if hits[i] { ':' } else { '-' }, line);
+                    if next_kept.is_some_and(|k| k > i + 1) {
+                        row.push_str("\n--");
+                    }
+                    if !out.push(row) {
+                        break;
+                    }
+                    next_kept = Some(i);
                 }
-                let picks = (0..total).filter(|i| keep[*i]).map(|i| (i, hits[i]));
-                (picks.collect(), hits.iter().filter(|h| **h).count())
+                out.reverse();
+                hits.iter().filter(|h| **h).count()
             }
         };
-        let mut rendered = Vec::with_capacity(picks.len());
-        let mut prev: Option<usize> = None;
-        for (i, hit) in picks {
-            if prev.is_some_and(|p| i > p + 1) {
-                rendered.push("--".to_string());
-            }
-            let mark = if hit { ':' } else { '-' };
-            rendered.push(format!("{}{mark}{}", i + 1, clip(lines[i])));
-            prev = Some(i);
-        }
-        let keep_end = matches!(query, Query::Tail { .. });
-        let (lines, truncated) = fit(rendered, max_bytes, keep_end);
+        let (lines, truncated) = out.finish();
         Page {
             lines,
             total_lines: total,
@@ -159,35 +173,56 @@ impl Log {
     }
 }
 
-fn clip(line: &str) -> String {
+fn render(i: usize, mark: char, line: &str) -> String {
     if line.len() <= LINE_CAP {
-        return line.to_string();
+        return format!("{}{mark}{line}", i + 1);
     }
     let cut = line.floor_char_boundary(LINE_CAP);
-    format!("{}... [{} bytes cut]", &line[..cut], line.len() - cut)
+    format!(
+        "{}{mark}{}... [{} bytes cut]",
+        i + 1,
+        &line[..cut],
+        line.len() - cut
+    )
 }
 
-// whole lines up to max_bytes, from the end when keep_end
-fn fit(rendered: Vec<String>, max_bytes: usize, keep_end: bool) -> (String, bool) {
-    let all = rendered.len();
-    let mut used = 0;
-    let fits = |l: &String| {
-        used += l.len() + 1;
-        used <= max_bytes
-    };
-    let kept: Vec<String> = if keep_end {
-        let mut tail: Vec<_> = rendered.into_iter().rev().take_while(fits).collect();
-        tail.reverse();
-        tail
-    } else {
-        rendered.into_iter().take_while(fits).collect()
-    };
-    let truncated = kept.len() < all;
-    let mut out = kept.join("\n");
-    if !kept.is_empty() {
-        out.push('\n');
+struct Budget {
+    rows: Vec<String>,
+    used: usize,
+    max: usize,
+    truncated: bool,
+}
+
+impl Budget {
+    fn new(max: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            used: 0,
+            max,
+            truncated: false,
+        }
     }
-    (out, truncated)
+
+    fn push(&mut self, row: String) -> bool {
+        self.used += row.len() + 1;
+        self.truncated = self.used > self.max;
+        if !self.truncated {
+            self.rows.push(row);
+        }
+        !self.truncated
+    }
+
+    fn reverse(&mut self) {
+        self.rows.reverse();
+    }
+
+    fn finish(self) -> (String, bool) {
+        let mut out = self.rows.join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        (out, self.truncated)
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +230,7 @@ mod tests {
     use crate::logs::{Log, LogName, MAX_READ, Query};
 
     fn log(text: &str) -> Log {
-        Log::from_bytes(text.as_bytes().to_vec())
+        Log::from_bytes(text.as_bytes().to_vec(), MAX_READ)
     }
 
     fn numbered(n: usize) -> Log {
@@ -304,6 +339,44 @@ mod tests {
     }
 
     #[test]
+    fn grep_overflow_keeps_the_newest_matches() {
+        let log = numbered(12);
+        let page = log.query(&Query::grep("^line (2|4|10|11)$", 1).unwrap(), 54);
+        assert_eq!(
+            (page.lines.as_str(), page.truncated, page.matched),
+            (
+                "5-line 5\n--\n9-line 9\n10:line 10\n11:line 11\n12-line 12\n",
+                true,
+                4
+            )
+        );
+    }
+
+    #[test]
+    fn huge_logs_of_short_lines_render_only_what_fits() {
+        let lines = 2 * 1024 * 1024;
+        let log = log(&"x\n".repeat(lines));
+        let started = std::time::Instant::now();
+        let tail = log.query(&Query::Tail { lines: usize::MAX }, 20);
+        assert_eq!(
+            (tail.lines.as_str(), tail.matched, tail.truncated),
+            ("2097151:x\n2097152:x\n", lines, true)
+        );
+        let range = log.query(&Query::Range { from: 1, to: None }, 8);
+        assert_eq!(
+            (range.lines.as_str(), range.truncated),
+            ("1:x\n2:x\n", true)
+        );
+        let grep = log.query(&Query::grep("x", 20).unwrap(), 10);
+        assert_eq!(
+            (grep.lines.as_str(), grep.matched, grep.truncated),
+            ("2097152:x\n", lines, true)
+        );
+        assert_eq!(grep.total_lines, lines);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
     fn long_lines_are_clipped_on_a_char_boundary() {
         let line = format!("{}é{}", "a".repeat(1023), "b".repeat(500));
         let page = log(&line).query(&Query::Tail { lines: 1 }, 64 * 1024);
@@ -318,7 +391,7 @@ mod tests {
         let window = usize::try_from(MAX_READ).unwrap();
         let mut bytes = b"partial\nwhole\n".to_vec();
         bytes.resize(window + 1, b'x');
-        let log = Log::from_bytes(bytes);
+        let log = Log::from_bytes(bytes, MAX_READ);
         let page = log.query(
             &Query::Range {
                 from: 1,
@@ -330,7 +403,8 @@ mod tests {
         assert_eq!(page.lines, "1:whole\n");
         assert_eq!(page.total_lines, 2);
 
-        let page = Log::from_bytes(b"ok \xff\n".to_vec()).query(&Query::Tail { lines: 1 }, 1024);
+        let page =
+            Log::from_bytes(b"ok \xff\n".to_vec(), MAX_READ).query(&Query::Tail { lines: 1 }, 1024);
         assert!(!page.truncated_head);
         assert_eq!(page.lines, "1:ok \u{fffd}\n");
     }

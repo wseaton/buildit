@@ -21,7 +21,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, PodOpts, Resources};
-use crate::logs::{LOG_DIR, Log, LogName, Page, Query};
+use crate::logs::{LOG_DIR, Log, LogName, MAX_READ, Page, Query};
 use crate::pod::BuilderPod;
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace};
 
@@ -42,6 +42,7 @@ const EXEC_SLACK: Duration = Duration::from_secs(60);
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SUMMARY_LINES: usize = 40;
 const SUMMARY_BYTES: usize = 8 * 1024;
+const SUMMARY_WINDOW: u64 = 256 * 1024;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
@@ -391,7 +392,7 @@ async fn log_tail(pod: &BuilderPod, log: LogName) -> Result<String> {
     let tail = Query::Tail {
         lines: SUMMARY_LINES,
     };
-    Ok(Log::fetch(pod, log)
+    Ok(Log::fetch(pod, log, SUMMARY_WINDOW)
         .await?
         .query(&tail, SUMMARY_BYTES)
         .lines)
@@ -692,7 +693,9 @@ impl Broker {
             .unwrap_or(DEFAULT_LOG_BYTES)
             .clamp(1024, MAX_LOG_BYTES);
         let pod = self.find(sandbox, &id).await?;
-        Ok(Log::fetch(&pod, name).await?.query(&query, usize_of(max)))
+        Ok(Log::fetch(&pod, name, MAX_READ)
+            .await?
+            .query(&query, usize_of(max)))
     }
 
     pub async fn clean(&self, sandbox: &SandboxName, id: Option<&str>) -> Result<CleanReply> {
@@ -765,6 +768,8 @@ impl BuilditMcp {
         description = "Read part of a build or run log, as numbered lines: grep with optional \
         context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
         total_lines and matched; output is capped at max_bytes and long lines are clipped. \
+        When output overflows max_bytes, tail and grep keep the newest lines (the end of the \
+        log) and range keeps the first; truncated is set. \
         Only the newest 4 MiB is read; when truncated_head is set, line 1 is the first whole \
         line of that window."
     )]
