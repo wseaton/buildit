@@ -126,6 +126,33 @@ on quay registries buildit defaults to `quay.expires-after=2w` (override or
 extend with `--context-label`). Elsewhere the `buildit-ctx-*` tags are tiny
 and content-addressed; prune with your registry's lifecycle policy.
 
+## MCP server
+
+`buildit mcp` serves `build`, `run`, `logs`, and `clean` as MCP tools over
+stateless streamable http, for agents in sandboxes that can't build images.
+`build` downloads a workspace subdirectory from the caller's sandbox and
+builds it with buildah, optionally to a `target` stage, without pushing. `run`
+runs a command in a fresh container of the image and copies `fetch_paths`
+back to `.buildit/<build_id>/` in the sandbox. `logs` reads the newest 4 MiB
+of a build or run log from the builder pod and queries it in the server, one
+of `grep` (a Rust regex, with up to 20 lines of `context`), a
+`from_line`/`to_line` range, or the last `tail_lines` (default 100). Output is
+numbered lines capped at `max_bytes` (default 16 KiB, max 64 KiB); on
+overflow, grep and tail keep the end of the log and range keeps its start.
+`clean` deletes builder pods.
+
+Callers are identified by the bearer token alone: `MCP_TOKENS_FILE` holds
+`<token> <sandbox> [<workdir>]` lines (a missing workdir falls back to
+`BROKER_SANDBOX_WORKDIR`) and is re-read on every request. Builds are found by
+pod labels, so a restarted server keeps serving them, and a sandbox only sees
+its own. Builder pods mount no service account token and end at
+`--pod-deadline`; a sandbox may hold `--max-builds` live ones.
+
+```sh
+MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp
+BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored   # e2e on a disposable cluster
+```
+
 ## How it compares
 
 - **`docker buildx` (kubernetes driver)** — the closest relative. It keeps a

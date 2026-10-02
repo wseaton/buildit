@@ -4,9 +4,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, AttachParams, AttachedProcess, DeleteParams, ListParams, PostParams};
 use kube::runtime::wait::{await_condition, conditions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::backend::Backend;
+
+pub struct ExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    // None when stdout went past the limit and the process was cut off
+    pub code: Option<i32>,
+}
 
 pub struct BuilderPod {
     pods: Api<Pod>,
@@ -31,13 +38,24 @@ impl BuilderPod {
         backend: Backend,
         opts: &crate::backend::PodOpts<'_>,
     ) -> Result<Self> {
+        let spec = backend.pod_spec(&unique_name(), namespace, opts)?;
+        Self::create_from(client, namespace, &spec).await
+    }
+
+    pub async fn create_from(client: kube::Client, namespace: &str, spec: &Pod) -> Result<Self> {
         let pods: Api<Pod> = Api::namespaced(client, namespace);
-        let name = unique_name();
-        let spec = backend.pod_spec(&name, namespace, opts)?;
-        pods.create(&PostParams::default(), &spec)
+        let name = spec.metadata.name.clone().unwrap_or_default();
+        pods.create(&PostParams::default(), spec)
             .await
             .with_context(|| format!("creating pod {name} in {namespace}"))?;
         Ok(Self { pods, name })
+    }
+
+    pub fn existing(client: kube::Client, namespace: &str, name: &str) -> Self {
+        Self {
+            pods: Api::namespaced(client, namespace),
+            name: name.to_string(),
+        }
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -51,26 +69,40 @@ impl BuilderPod {
         Ok(())
     }
 
-    async fn finish(&self, mut attached: AttachedProcess, argv: &[String]) -> Result<()> {
+    // Err when the command never ran
+    async fn exit_code(&self, mut attached: AttachedProcess) -> Result<i32> {
         let status = attached
             .take_status()
             .ok_or_else(|| anyhow!("exec status channel already taken"))?
             .await;
         attached.join().await.context("joining exec stream")?;
-        match status {
-            Some(s) if s.status.as_deref() == Some("Success") => Ok(()),
-            Some(s) => bail!(
+        let status =
+            status.ok_or_else(|| anyhow!("no exit status received from pod {}", self.name))?;
+        if status.status.as_deref() == Some("Success") {
+            return Ok(0);
+        }
+        status
+            .details
+            .as_ref()
+            .and_then(|d| d.causes.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .find(|c| c.reason.as_deref() == Some("ExitCode"))
+            .and_then(|c| c.message.as_deref()?.trim().parse().ok())
+            .ok_or_else(|| anyhow!("{}", status.message.unwrap_or_default()))
+    }
+
+    async fn finish(&self, attached: AttachedProcess, argv: &[String]) -> Result<()> {
+        let code = self.exit_code(attached).await;
+        if !matches!(code, Ok(0)) {
+            bail!(
                 "`{}` failed in pod {}: {}",
                 argv.join(" "),
                 self.name,
-                s.message.unwrap_or_else(|| "no error message".to_string())
-            ),
-            None => bail!(
-                "`{}` in pod {}: no exit status received",
-                argv.join(" "),
-                self.name
-            ),
+                code.map_or_else(|e| format!("{e:#}"), |c| format!("exit code {c}"))
+            );
         }
+        Ok(())
     }
 
     // exit status comes from the real status frame; a piped exit code once
@@ -133,6 +165,50 @@ impl BuilderPod {
             .context("capturing exec stdout")?;
         self.finish(attached, argv).await?;
         String::from_utf8(buf).context("exec output was not utf-8")
+    }
+
+    // stdout up to `limit` bytes, stderr, and the exit status
+    pub async fn exec_output(&self, argv: &[String], limit: u64) -> Result<ExecOutput> {
+        let params = AttachParams::default().stdout(true).stderr(true);
+        let mut attached = self
+            .pods
+            .exec(&self.name, argv.iter().map(String::as_str), &params)
+            .await
+            .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
+        let stdout = attached
+            .stdout()
+            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
+        let mut stderr = attached
+            .stderr()
+            .ok_or_else(|| anyhow!("exec stderr stream missing"))?;
+        let err = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf).await.map(|_| buf)
+        });
+        let mut out = Vec::new();
+        stdout
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut out)
+            .await
+            .context("reading exec stdout")?;
+        if out.len() as u64 > limit {
+            err.abort();
+            out.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+            return Ok(ExecOutput {
+                stdout: out,
+                stderr: Vec::new(),
+                code: None,
+            });
+        }
+        let stderr = err
+            .await
+            .context("joining exec stderr")?
+            .context("reading exec stderr")?;
+        Ok(ExecOutput {
+            stdout: out,
+            stderr,
+            code: Some(self.exit_code(attached).await?),
+        })
     }
 
     pub async fn delete(&self) -> Result<()> {

@@ -3,8 +3,11 @@ mod backend;
 mod build;
 mod context;
 mod job;
+mod logs;
+mod mcp;
 mod oci;
 mod pod;
+mod sandbox;
 mod schedule;
 
 use std::path::PathBuf;
@@ -39,6 +42,8 @@ enum Cmd {
         #[arg(long)]
         kubecontext: Option<String>,
     },
+    /// Serve build/run/logs/clean as stateless MCP tools over streamable http
+    Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {
         #[arg(short, long, default_value = "default", env = "BUILDIT_NAMESPACE")]
@@ -219,6 +224,10 @@ async fn main() -> Result<()> {
         } => {
             let client = client_for(kubecontext.as_deref()).await?;
             job::wait(client, &namespace, &job).await
+        }
+        Cmd::Mcp(args) => {
+            let client = client_for(args.kubecontext.as_deref()).await?;
+            mcp::serve(client, *args).await
         }
         Cmd::Clean {
             namespace,
