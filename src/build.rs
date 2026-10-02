@@ -2,20 +2,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::pod::{BuilderPod, LogSink};
+use crate::pod::BuilderPod;
 use crate::{BuildArgs, Mode, Schedule};
 use crate::{auth, backend, context, job, oci, pod, schedule};
-
-pub(crate) const POD_DEADLINE_SECS: i64 = 7200;
-pub(crate) const POD_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
 // quay.io/foo:tag -> quay.io/foo@sha256:...
 pub(crate) fn pinned_ref(image: &str, digest: &str) -> String {
     format!("{}@{digest}", oci::repo_of(image))
 }
 
-// returns the digest-pinned ref in pod mode, the job name in job mode
-pub async fn run(client: kube::Client, args: &BuildArgs, sink: &mut LogSink) -> Result<String> {
+pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
     let registry = auth::registry_of(&args.image)?;
     let authfile = auth::minimal_authfile(&registry)?;
 
@@ -59,15 +55,12 @@ pub async fn run(client: kube::Client, args: &BuildArgs, sink: &mut LogSink) -> 
         resources: &resources,
         cache: args.cache(),
         node: args.node.as_deref(),
-        deadline_secs: POD_DEADLINE_SECS,
-        owner: None,
-        meta: None,
     };
     let pod = BuilderPod::create(client, &args.namespace, args.backend, &opts).await?;
     tracing::info!("builder pod {} created, waiting for ready", pod.name);
 
     let outcome = tokio::select! {
-        result = drive(&pod, args, &tarball, &authfile, sink) => result,
+        result = drive(&pod, args, &tarball, &authfile) => result,
         _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted, cleaning up")),
     };
 
@@ -80,17 +73,18 @@ pub async fn run(client: kube::Client, args: &BuildArgs, sink: &mut LogSink) -> 
 
     let digest = outcome?;
     tracing::info!("pushed {}", args.image);
-    Ok(pinned_ref(&args.image, &digest))
+    println!("{}", pinned_ref(&args.image, &digest));
+    Ok(())
 }
 
-// push context to the registry, hand the build to a Job, return its name
+// push context to the registry, hand the build to a Job, print the handle
 async fn detach(
     client: kube::Client,
     args: &BuildArgs,
     registry: &str,
     authfile: &[u8],
     idle_nodes: &[String],
-) -> Result<String> {
+) -> Result<()> {
     let tar = context::tar_bytes(&args.context)?;
     tracing::info!("context tar: {} KiB", tar.len() / 1024);
     let ctx_ref = oci::context_reference(&args.image, &tar);
@@ -114,7 +108,6 @@ async fn detach(
         &job::DetachArgs {
             image: &args.image,
             dockerfile: &args.dockerfile,
-            target: args.target.as_deref(),
             build_args: &args.build_args,
             ctx_ref: &ctx_ref,
             authfile,
@@ -130,11 +123,12 @@ async fn detach(
         "job {job} created; follow with `buildit wait {job} -n {}`",
         args.namespace
     );
-    Ok(job)
+    println!("{job}");
+    Ok(())
 }
 
-// --output render: manifests as YAML, touch nothing
-pub fn render(args: &BuildArgs) -> Result<String> {
+// --output render: print manifests as YAML, touch nothing
+pub fn render(args: &BuildArgs) -> Result<()> {
     let name = crate::pod::unique_name();
     let resources = args.resources();
     match args.mode {
@@ -144,12 +138,9 @@ pub fn render(args: &BuildArgs) -> Result<String> {
                 resources: &resources,
                 cache: args.cache(),
                 node: args.node.as_deref(),
-                deadline_secs: POD_DEADLINE_SECS,
-                owner: None,
-                meta: None,
             };
             let pod = args.backend.pod_spec(&name, &args.namespace, &opts)?;
-            Ok(serde_norway::to_string(&pod)?)
+            print!("{}", serde_norway::to_string(&pod)?);
         }
         Mode::Job => {
             let tar = context::tar_bytes(&args.context)?;
@@ -160,7 +151,6 @@ pub fn render(args: &BuildArgs) -> Result<String> {
                 &job::DetachArgs {
                     image: &args.image,
                     dockerfile: &args.dockerfile,
-                    target: args.target.as_deref(),
                     build_args: &args.build_args,
                     ctx_ref: &ctx_ref,
                     authfile: b"",
@@ -174,13 +164,14 @@ pub fn render(args: &BuildArgs) -> Result<String> {
             tracing::info!("secret data redacted; a real run ships your registry token");
             tracing::info!("a real run pushes the context to {ctx_ref} first");
             let secret = job::secret_manifest(&name, &args.namespace, b"<redacted>", None);
-            Ok(format!(
+            print!(
                 "{}---\n{}",
                 serde_norway::to_string(&spec)?,
                 serde_norway::to_string(&secret)?
-            ))
+            );
         }
     }
+    Ok(())
 }
 
 async fn drive(
@@ -188,13 +179,12 @@ async fn drive(
     args: &BuildArgs,
     tarball: &[u8],
     authfile: &[u8],
-    sink: &mut LogSink,
 ) -> Result<String> {
     let backend = args.backend;
-    pod.wait_ready(POD_READY_TIMEOUT).await?;
+    pod.wait_ready(Duration::from_secs(180)).await?;
 
     tracing::info!("staging source + auth");
-    pod.exec_stream(&backend.setup_command(), sink).await?;
+    pod.exec_stream(&backend.setup_command()).await?;
     pod.exec_with_stdin(&backend.untar_command(), tarball)
         .await?;
     pod.exec_with_stdin(&backend.auth_upload_command(), authfile)
@@ -204,11 +194,10 @@ async fn drive(
     for step in backend.build_steps(
         &args.image,
         &args.dockerfile,
-        args.target.as_deref(),
         &args.build_args,
         &args.labels,
     ) {
-        pod.exec_stream(&step, sink).await?;
+        pod.exec_stream(&step).await?;
     }
 
     let raw = pod

@@ -41,7 +41,7 @@ cargo install --git https://github.com/wseaton/buildit
 buildit build quay.io/acme/foo:tag                 # context=., Dockerfile, current kubecontext
 buildit build quay.io/acme/foo:tag \
   -f Dockerfile.prod -c ./svc -n builds \
-  --backend buildah --build-arg FOO=bar --target runtime
+  --backend buildah --build-arg FOO=bar
 JOB=$(buildit build quay.io/acme/foo:tag --mode job | tail -1)   # fire and forget
 buildit wait $JOB                                  # reattach anytime, prints the digest
 buildit build quay.io/acme/foo:tag \
@@ -129,64 +129,23 @@ and content-addressed; prune with your registry's lifecycle policy.
 ## MCP server
 
 `buildit mcp` serves `build`, `run`, `logs`, and `clean` as MCP tools over
-streamable http, for an agent in a sandbox that can't build images itself
-(it runs as a crucible `[agent.broker]` on the loop pod).
+stateless streamable http, for agents in sandboxes that can't build images.
+`build` downloads a workspace subdirectory from the caller's sandbox and
+builds it with buildah, optionally to a `target` stage, without pushing. `run`
+runs a command in a fresh container of the image and copies `fetch_paths`
+back to `.buildit/<build_id>/` in the sandbox. `logs` greps, slices, or tails
+a build or run log inside the builder pod. `clean` deletes builder pods.
 
-- `build` pulls a workspace subdirectory out of the sandbox
-  (`openshell sandbox download`), builds it without pushing, and keeps the
-  builder pod. The reply carries the log's line count, its last 40 lines and,
-  on failure, the first lines matching `error|fatal|undefined|cannot|failed`.
-- `run` starts a fresh container of a built image (buildah backend), runs a
-  command, and copies `fetch_paths` back to `.buildit/<build_id>/<path>`.
-  Only regular files and directories come back. Each run gets its own log,
-  `run:<n>`.
-- `logs` reads part of a log (`build`, `run:<n>`, or `latest`): a line range,
-  a regex with context, head or tail, capped at `max_bytes`. Lines come back
-  numbered, grep style.
-- `clean` deletes builder pods.
-
-The server is stateless: no MCP sessions, every POST is answered with plain
-JSON, and nothing about a build lives in server memory. Builder pods carry
-`buildit.dev/managed-by=mcp`, `buildit.dev/build-id`, `buildit.dev/sandbox`,
-and `buildit.dev/state` labels, and every lookup goes through them, so a
-restarted server or a second replica keeps serving existing builds. Logs are
-appended inside the pod under `/buildit/logs` (a 1Gi emptyDir) by the commands
-themselves; copies of their last 32 MiB land at `.buildit/<build_id>/build.log`
-and `run-<n>.log`. A sandbox may hold `--max-builds` live builder pods
-(default 4), and the namespace `--max-builds-total` across every sandbox and
-server (default 16); past either `build` is refused until a `clean`. A `build` call that
-returns an error, or is cut off by a disconnect or shutdown, deletes its pod;
-other builder pods survive a shutdown and go with the serving workload (an
-ownerReference to the top of the serving pod's controller chain, e.g. its
-Deployment, which takes `get` on that chain's kinds), at `--pod-deadline`, or
-on `clean`. Pods that end at the deadline are deleted by the next `build`.
-
-Callers are identified by the bearer token alone. `MCP_TOKENS_FILE` names a
-file of `<token> <sandbox> [<workdir>]` lines (crucible writes it), re-read on
-every request; the matching line gives the caller's sandbox and the sandbox
-path its context is downloaded from and its results uploaded to. A line
-without a workdir uses `BROKER_SANDBOX_WORKDIR`. An unknown or missing token
-gets 401, and a build is only visible to the sandbox that made it. `Host` must
-be loopback, `host.openshell.internal`,
-`host.containers.internal`, or listed in `BROKER_ALLOWED_HOSTS`. The context
-must be a subdirectory not reached through a symlink. Symlinks inside it ship
-as links when they resolve inside the context and are dropped otherwise.
-`.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube`, `.jira` are never
-shipped, and results are never written through a symlink under `.buildit`.
-Builder pods get no service account token, no service links, an
-`activeDeadlineSeconds`, and an ownerReference to the serving workload.
-
-`MCP_BIND` (alias `BROKER_BIND`) sets the listen address, `MCP_NAME` the
-server name, and `MCP_TOOLS` a comma-separated subset of the tools to serve.
+Callers are identified by the bearer token alone: `MCP_TOKENS_FILE` holds
+`<token> <sandbox> [<workdir>]` lines (a missing workdir falls back to
+`BROKER_SANDBOX_WORKDIR`) and is re-read on every request. Builds are found by
+pod labels, so a restarted server keeps serving them, and a sandbox only sees
+its own. Builder pods mount no service account token and end at
+`--pod-deadline`; a sandbox may hold `--max-builds` live ones.
 
 ```sh
-# in-cluster (namespace from the service account)
-MCP_TOKENS_FILE=/run/crucible/buildit.tokens BROKER_SANDBOX_WORKDIR=/sandbox/repo buildit mcp
-# off-cluster dev: a local dir stands in for the sandbox, one fixed token and sandbox
-BROKER_TOKEN=dev buildit mcp --local-workdir . --dev-sandbox me \
-  --kubecontext kind-dev -n default --bind 127.0.0.1:8849
-# end-to-end tests against a disposable cluster
-BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored
+MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp
+BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored   # e2e on a disposable cluster
 ```
 
 ## How it compares
