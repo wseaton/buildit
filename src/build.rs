@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::pod::BuilderPod;
 use crate::{BuildArgs, Mode, Schedule};
@@ -11,9 +11,24 @@ pub(crate) fn pinned_ref(image: &str, digest: &str) -> String {
     format!("{}@{digest}", oci::repo_of(image))
 }
 
+fn check(args: &BuildArgs) -> Result<()> {
+    if args.no_push && args.mode == Mode::Job {
+        bail!("--no-push needs --mode pod: a job build pushes its context and its image");
+    }
+    Ok(())
+}
+
 pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
-    let registry = auth::registry_of(&args.image)?;
-    let authfile = auth::minimal_authfile(&registry)?;
+    check(args)?;
+    let authfile = auth::registry_of(&args.image).and_then(|r| auth::minimal_authfile(&r));
+    let authfile = match (authfile, args.no_push) {
+        (Ok(authfile), _) => authfile,
+        (Err(e), true) => {
+            tracing::info!("--no-push: shipping no registry credentials ({e:#})");
+            br#"{"auths":{}}"#.to_vec()
+        }
+        (Err(e), false) => return Err(e),
+    };
 
     tracing::info!(
         "context: {}  dockerfile: {}  ->  {}  (ns={}, backend={:?}, mode={:?})",
@@ -43,7 +58,7 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
     }
 
     if args.mode == Mode::Job {
-        return detach(client, args, &registry, &authfile, &idle_nodes).await;
+        return detach(client, args, &authfile, &idle_nodes).await;
     }
 
     let tarball = context::tarball(&args.context)?;
@@ -71,9 +86,13 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
         tracing::info!("builder pod {} deleted", pod.name);
     }
 
-    let digest = outcome?;
-    tracing::info!("pushed {}", args.image);
-    println!("{}", pinned_ref(&args.image, &digest));
+    match outcome? {
+        Some(digest) => {
+            tracing::info!("pushed {}", args.image);
+            println!("{}", pinned_ref(&args.image, &digest));
+        }
+        None => tracing::info!("built {} without pushing it", args.image),
+    }
     Ok(())
 }
 
@@ -81,17 +100,17 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
 async fn detach(
     client: kube::Client,
     args: &BuildArgs,
-    registry: &str,
     authfile: &[u8],
     idle_nodes: &[String],
 ) -> Result<()> {
     let tar = context::tar_bytes(&args.context)?;
     tracing::info!("context tar: {} KiB", tar.len() / 1024);
     let ctx_ref = oci::context_reference(&args.image, &tar);
-    let (user, pass) = auth::basic_credentials(registry)?;
+    let registry = auth::registry_of(&args.image)?;
+    let (user, pass) = auth::basic_credentials(&registry)?;
     let reg_auth = oci_client::secrets::RegistryAuth::Basic(user, pass);
     let ctx_labels = if args.context_labels.is_empty() {
-        let defaults = oci::default_context_labels(registry);
+        let defaults = oci::default_context_labels(&registry);
         for (k, v) in &defaults {
             tracing::info!("context label default for {registry}: {k}={v}");
         }
@@ -108,6 +127,7 @@ async fn detach(
         &job::DetachArgs {
             image: &args.image,
             dockerfile: &args.dockerfile,
+            target: args.target.as_deref(),
             build_args: &args.build_args,
             ctx_ref: &ctx_ref,
             authfile,
@@ -129,6 +149,7 @@ async fn detach(
 
 // --output render: print manifests as YAML, touch nothing
 pub fn render(args: &BuildArgs) -> Result<()> {
+    check(args)?;
     let name = crate::pod::unique_name();
     let resources = args.resources();
     match args.mode {
@@ -151,6 +172,7 @@ pub fn render(args: &BuildArgs) -> Result<()> {
                 &job::DetachArgs {
                     image: &args.image,
                     dockerfile: &args.dockerfile,
+                    target: args.target.as_deref(),
                     build_args: &args.build_args,
                     ctx_ref: &ctx_ref,
                     authfile: b"",
@@ -179,7 +201,7 @@ async fn drive(
     args: &BuildArgs,
     tarball: &[u8],
     authfile: &[u8],
-) -> Result<String> {
+) -> Result<Option<String>> {
     let backend = args.backend;
     pod.wait_ready(Duration::from_secs(180)).await?;
 
@@ -190,26 +212,114 @@ async fn drive(
     pod.exec_with_stdin(&backend.auth_upload_command(), authfile)
         .await?;
 
-    tracing::info!("building + pushing (this can take several minutes)");
+    let push = !args.no_push;
+    tracing::info!(
+        "building{} (this can take several minutes)",
+        if push { " + pushing" } else { "" }
+    );
     for step in backend.build_steps(
         &args.image,
         &args.dockerfile,
+        args.target.as_deref(),
+        push,
         &args.build_args,
         &args.labels,
     ) {
         pod.exec_stream(&step).await?;
+    }
+    if !push {
+        return Ok(None);
     }
 
     let raw = pod
         .exec_capture(&backend.digest_command())
         .await
         .context("reading image digest")?;
-    backend.digest_from(&raw)
+    backend.digest_from(&raw).map(Some)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::build::pinned_ref;
+    use crate::build::{pinned_ref, render, run};
+    use crate::{BuildArgs, Cli, Cmd};
+
+    fn build_args(argv: &[&str]) -> BuildArgs {
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["buildit", "build"].iter().chain(argv)).unwrap();
+        match cli.cmd {
+            Cmd::Build(args) => *args,
+            _ => panic!("not a build"),
+        }
+    }
+
+    #[test]
+    fn target_and_no_push_parse_and_no_push_refuses_job_mode() {
+        let args = build_args(&["quay.io/acme/foo:tag", "--target", "base", "--no-push"]);
+        assert_eq!(args.target.as_deref(), Some("base"));
+        assert!(args.no_push);
+        let args = build_args(&["quay.io/acme/foo:tag"]);
+        assert_eq!(args.target, None);
+        assert!(!args.no_push);
+
+        let job = build_args(&[
+            "quay.io/acme/foo:tag",
+            "--no-push",
+            "--mode",
+            "job",
+            "--output",
+            "render",
+        ]);
+        let e = render(&job).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("--no-push needs --mode pod"),
+            "{e:#}"
+        );
+        let pod = build_args(&["quay.io/acme/foo:tag", "--no-push", "--output", "render"]);
+        render(&pod).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_cli_builds_a_target_stage_without_pushing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM docker.io/library/busybox:latest AS base\n\
+             RUN echo stage-base\n\
+             FROM base AS broken\n\
+             RUN exit 1\n",
+        )
+        .unwrap();
+        let ctx = dir.path().to_str().unwrap();
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        for backend in ["buildah", "buildkit", "kaniko"] {
+            let args = |target: &[&str]| {
+                let mut argv = vec![
+                    "localhost/buildit-e2e:dev",
+                    "--context",
+                    ctx,
+                    "--backend",
+                    backend,
+                    "--schedule",
+                    "any",
+                    "--namespace",
+                    "default",
+                    "--no-push",
+                ];
+                argv.extend(target);
+                build_args(&argv)
+            };
+            run(client.clone(), &args(&["--target", "base"]))
+                .await
+                .unwrap_or_else(|e| panic!("{backend}: {e:#}"));
+            assert!(
+                run(client.clone(), &args(&[])).await.is_err(),
+                "{backend}: the broken final stage built"
+            );
+        }
+    }
 
     #[test]
     fn pin_swaps_tag_for_digest() {

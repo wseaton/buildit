@@ -43,11 +43,40 @@ const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
 const SUMMARY_LINES: usize = 40;
 const SUMMARY_BYTES: usize = 8 * 1024;
 const SUMMARY_WINDOW: u64 = 256 * 1024;
+const DEADLINE_MARGIN: Duration = Duration::from_secs(10);
+const DEADLINE_EXCEEDED: &str = "DeadlineExceeded";
+const CONTAINER_STDOUT: &str = "/proc/1/fd/1";
+const TERMINATION_LOG: &str = "/dev/termination-log";
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
 // appends `$ argv`, then the command's stdout and stderr, to the log
 const STEP_SCRIPT: &str = r#"log="$1"; secs="$2"; shift 2; mkdir -p "${log%/*}"; printf '$ %s\n' "$*" >> "$log"; exec timeout "$secs" "$@" >> "$log" 2>&1"#;
+// STEP_SCRIPT in the background: writes its pid, then `<exit code>[ timeout]` to the
+// exit file and the termination log, and mirrors the log to the container's stdout
+const LAUNCH_SCRIPT: &str = r#"log="$1"; exit_file="$2"; pid_file="$3"; secs="$4"; mirror="$5"; term="$6"; shift 6
+mkdir -p "${log%/*}"; printf '$ %s\n' "$*" >> "$log"
+{
+  start=$(date +%s)
+  timeout "$secs" "$@" >> "$log" 2>&1
+  code=$?
+  if [ "$code" -ne 0 ] && [ $(( $(date +%s) - start )) -ge "$secs" ]; then code="$code timeout"; fi
+  echo "$code" > "$exit_file.tmp"
+  cat "$exit_file.tmp" > "$term"
+  mv "$exit_file.tmp" "$exit_file"
+} < /dev/null > /dev/null 2>&1 &
+pid=$!
+echo "$pid" > "$pid_file"
+tail -n +1 -f --pid="$pid" "$log" < /dev/null 2> /dev/null > "$mirror" &"#;
+// prints running, lost, or `exit <record>`; zombies count as lost
+const STATE_SCRIPT: &str = r#"if [ -f "$1" ]; then echo "exit $(cat "$1")"; exit; fi
+pid=$(cat "$2" 2>/dev/null)
+case "$pid" in ""|*[!0-9]*) stat="" ;; *) stat=$(cat "/proc/$pid/stat" 2>/dev/null) ;; esac
+stat=${stat##*) }
+case "${stat%% *}" in
+  ""|Z|X) if [ -f "$1" ]; then echo "exit $(cat "$1")"; else echo lost; fi ;;
+  *) echo running ;;
+esac"#;
 const ALLOC_SCRIPT: &str = r#"set -C; n=1; until : > "$1/run-$n.log"; do n=$((n + 1)); [ "$n" -le 9999 ] || exit 1; done 2>/dev/null; echo "$n""#;
 const FETCH_SCRIPT: &str = r#"ctr="$1"; shift; mnt=$(buildah mount "$ctr") || exit 1; cd "$mnt" || exit 1; exec tar -cf - --ignore-failed-read -- "$@""#;
 
@@ -251,6 +280,7 @@ pub struct BuildParams {
     /// Dockerfile path relative to the context (default "Dockerfile")
     pub dockerfile: Option<String>,
     /// Multi-stage target to stop at
+    #[serde(alias = "build_target")]
     pub target: Option<String>,
     /// Build args, NAME -> value
     #[serde(default)]
@@ -260,8 +290,14 @@ pub struct BuildParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatusParams {
+    /// build_id from build
+    pub build_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunParams {
-    /// build_id returned by a successful build
+    /// build_id of a build whose status is succeeded
     pub build_id: String,
     /// argv to run in a fresh container of the built image; use ["sh", "-c", "..."] for a shell
     pub cmd: Vec<String>,
@@ -298,9 +334,118 @@ pub struct CleanParams {
     pub build_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildState {
+    Running,
+    Exited { code: i32, timed_out: bool },
+    Lost,
+    Expired,
+}
+
+impl BuildState {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim() {
+            "running" => Ok(Self::Running),
+            "lost" => Ok(Self::Lost),
+            other => other
+                .strip_prefix("exit ")
+                .and_then(Self::record)
+                .ok_or_else(|| anyhow!("unexpected build state {other:?}")),
+        }
+    }
+
+    // `<exit code>[ timeout]`, as LAUNCH_SCRIPT writes it
+    fn record(raw: &str) -> Option<Self> {
+        let (code, timed_out) = match raw.split_whitespace().collect::<Vec<_>>()[..] {
+            [code] => (code, false),
+            [code, "timeout"] => (code, true),
+            _ => return None,
+        };
+        Some(Self::Exited {
+            code: code.parse().ok()?,
+            timed_out,
+        })
+    }
+
+    fn status(self) -> BuildStatus {
+        match self {
+            Self::Running => BuildStatus::Running,
+            Self::Exited { code: 0, .. } => BuildStatus::Succeeded,
+            Self::Exited { .. } | Self::Lost | Self::Expired => BuildStatus::Failed,
+        }
+    }
+
+    fn exit(self) -> Option<i32> {
+        match self {
+            Self::Exited { code, .. } => Some(code),
+            Self::Running | Self::Lost | Self::Expired => None,
+        }
+    }
+
+    fn timed_out(self) -> bool {
+        match self {
+            Self::Exited { timed_out, .. } => timed_out,
+            Self::Expired => true,
+            Self::Running | Self::Lost => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PodView {
+    Live,
+    Ended(BuildState),
+}
+
+impl PodView {
+    // the build's pod, unless it is gone or being deleted
+    fn of(pods: &[Pod]) -> Option<Self> {
+        let pod = pods
+            .iter()
+            .find(|p| p.metadata.deletion_timestamp.is_none())?;
+        if alive(pod) {
+            return Some(Self::Live);
+        }
+        let status = pod.status.as_ref();
+        let record = status
+            .and_then(|s| s.container_statuses.as_deref())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c.state.as_ref()?.terminated.as_ref()?.message.as_deref())
+            .find_map(BuildState::record);
+        Some(Self::Ended(match record {
+            Some(state) => state,
+            None if status.and_then(|s| s.reason.as_deref()) == Some(DEADLINE_EXCEEDED) => {
+                BuildState::Expired
+            }
+            None => BuildState::Lost,
+        }))
+    }
+}
+
+enum Found {
+    Live(BuilderPod),
+    Ended(BuilderPod, BuildState),
+}
+
 #[derive(Debug, Serialize)]
 pub struct BuildReply {
     pub build_id: String,
+    pub status: BuildStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatusReply {
+    pub build_id: String,
+    pub status: BuildStatus,
     pub exit: Option<i32>,
     pub timed_out: bool,
     pub log_tail: String,
@@ -331,6 +476,20 @@ fn argv<const N: usize>(parts: [&str; N]) -> Vec<String> {
 
 fn timeout(requested: Option<u64>, default: u64) -> Duration {
     Duration::from_secs(requested.unwrap_or(default).clamp(1, 7200))
+}
+
+fn build_limit(requested: Duration, deadline_secs: i64, used: Duration) -> Result<Duration> {
+    let deadline = Duration::from_secs(u64::try_from(deadline_secs).unwrap_or(0));
+    let left = deadline
+        .saturating_sub(used)
+        .saturating_sub(DEADLINE_MARGIN);
+    if left < Duration::from_secs(1) {
+        bail!(
+            "the {deadline_secs}s pod deadline leaves no time to build after {}s of setup",
+            used.as_secs()
+        );
+    }
+    Ok(requested.min(left))
 }
 
 fn alive(pod: &Pod) -> bool {
@@ -388,14 +547,40 @@ async fn step(pod: &BuilderPod, log: LogName, limit: Duration, cmd: &[String]) -
     })
 }
 
-async fn log_tail(pod: &BuilderPod, log: LogName) -> Result<String> {
+fn build_file(name: &str) -> String {
+    format!("{LOG_DIR}/build.{name}")
+}
+
+async fn launch(pod: &BuilderPod, limit: Duration, cmd: &[String]) -> Result<()> {
+    let mut sh = argv(["sh", "-c", LAUNCH_SCRIPT, "sh"]);
+    sh.extend([
+        LogName::Build.path(),
+        build_file("exit"),
+        build_file("pid"),
+        limit.as_secs().to_string(),
+        CONTAINER_STDOUT.to_string(),
+        TERMINATION_LOG.to_string(),
+    ]);
+    sh.extend_from_slice(cmd);
+    pod.exec_capture(&sh).await?;
+    Ok(())
+}
+
+async fn build_state(pod: &BuilderPod) -> Result<BuildState> {
+    let mut sh = argv(["sh", "-c", STATE_SCRIPT, "sh"]);
+    sh.extend([build_file("exit"), build_file("pid")]);
+    BuildState::parse(&pod.exec_capture(&sh).await?)
+}
+
+fn summary(log: &Log) -> String {
     let tail = Query::Tail {
         lines: SUMMARY_LINES,
     };
-    Ok(Log::fetch(pod, log, SUMMARY_WINDOW)
-        .await?
-        .query(&tail, SUMMARY_BYTES)
-        .lines)
+    log.query(&tail, SUMMARY_BYTES).lines
+}
+
+async fn log_tail(pod: &BuilderPod, log: LogName) -> Result<String> {
+    Ok(summary(&Log::fetch(pod, log, SUMMARY_WINDOW).await?))
 }
 
 fn usize_of(n: u64) -> usize {
@@ -505,15 +690,21 @@ impl Broker {
             .items)
     }
 
+    async fn lookup(&self, sandbox: &SandboxName, id: &BuildId) -> Result<Found> {
+        let view = PodView::of(&self.list(sandbox, Some(id)).await?)
+            .ok_or_else(|| anyhow!("no live build {}; build again", id.0))?;
+        let pod = BuilderPod::existing(self.client.clone(), &self.namespace, &id.0);
+        Ok(match view {
+            PodView::Live => Found::Live(pod),
+            PodView::Ended(state) => Found::Ended(pod, state),
+        })
+    }
+
     async fn find(&self, sandbox: &SandboxName, id: &BuildId) -> Result<BuilderPod> {
-        if !self.list(sandbox, Some(id)).await?.iter().any(alive) {
-            bail!("no live build {}; build again", id.0);
+        match self.lookup(sandbox, id).await? {
+            Found::Live(pod) => Ok(pod),
+            Found::Ended(..) => bail!("build {}'s pod has ended; build again", id.0),
         }
-        Ok(BuilderPod::existing(
-            self.client.clone(),
-            &self.namespace,
-            &id.0,
-        ))
     }
 
     fn builder_pod(&self, sandbox: &SandboxName, id: &BuildId) -> Result<Pod> {
@@ -580,6 +771,7 @@ impl Broker {
             context.as_str(),
             tarball.len() / 1024
         );
+        let created = Instant::now();
         let pod = BuilderPod::create_from(
             self.client.clone(),
             &self.namespace,
@@ -591,13 +783,12 @@ impl Broker {
             pod.exec_capture(&Backend::Buildah.setup_command()).await?;
             pod.exec_with_stdin(&Backend::Buildah.untar_command(), &tarball)
                 .await?;
-            let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
-            let outcome = step(&pod, LogName::Build, limit, &bud).await?;
+            let requested = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
+            let limit = build_limit(requested, self.deadline_secs, created.elapsed())?;
+            launch(&pod, limit, &bud).await?;
             Ok(BuildReply {
                 build_id: id.0.clone(),
-                exit: outcome.exit,
-                timed_out: outcome.timed_out,
-                log_tail: log_tail(&pod, LogName::Build).await?,
+                status: BuildStatus::Running,
             })
         }
         .await;
@@ -607,6 +798,30 @@ impl Broker {
             tracing::warn!("deleting builder pod {}: {e:#}", id.0);
         }
         built
+    }
+
+    pub async fn status(&self, sandbox: &SandboxName, p: StatusParams) -> Result<StatusReply> {
+        let id = BuildId::parse(&p.build_id)?;
+        let (state, log_tail) = match self.lookup(sandbox, &id).await? {
+            Found::Live(pod) => (
+                build_state(&pod).await?,
+                log_tail(&pod, LogName::Build).await?,
+            ),
+            Found::Ended(pod, state) => match Log::from_container(&pod, SUMMARY_WINDOW).await {
+                Ok(log) => (state, summary(&log)),
+                Err(e) => {
+                    tracing::warn!("reading the ended build {}'s log: {e:#}", id.0);
+                    (state, String::new())
+                }
+            },
+        };
+        Ok(StatusReply {
+            build_id: id.0,
+            status: state.status(),
+            exit: state.exit(),
+            timed_out: state.timed_out(),
+            log_tail,
+        })
     }
 
     pub async fn run(&self, caller: &Caller, p: RunParams) -> Result<RunReply> {
@@ -620,6 +835,15 @@ impl Broker {
             .map(|f| RelPath::parse(f.trim_start_matches('/')))
             .collect::<Result<Vec<_>>>()?;
         let pod = self.find(&caller.sandbox, &id).await?;
+        match build_state(&pod).await? {
+            BuildState::Exited { code: 0, .. } => {}
+            BuildState::Running => bail!("build {} is still building; poll status", id.0),
+            state => bail!(
+                "build {} failed (exit {}); read its logs, then clean",
+                id.0,
+                state.exit().map_or("none".to_string(), |c| c.to_string())
+            ),
+        }
         let alloc = pod
             .exec_capture(&argv(["sh", "-c", ALLOC_SCRIPT, "sh", LOG_DIR]))
             .await?;
@@ -692,10 +916,14 @@ impl Broker {
             .max_bytes
             .unwrap_or(DEFAULT_LOG_BYTES)
             .clamp(1024, MAX_LOG_BYTES);
-        let pod = self.find(sandbox, &id).await?;
-        Ok(Log::fetch(&pod, name, MAX_READ)
-            .await?
-            .query(&query, usize_of(max)))
+        let log = match self.lookup(sandbox, &id).await? {
+            Found::Live(pod) => Log::fetch(&pod, name, MAX_READ).await?,
+            Found::Ended(pod, _) if name == LogName::Build => {
+                Log::from_container(&pod, MAX_READ).await?
+            }
+            Found::Ended(..) => bail!("build {}'s pod has ended; only its build log is kept", id.0),
+        };
+        Ok(log.query(&query, usize_of(max)))
     }
 
     pub async fn clean(&self, sandbox: &SandboxName, id: Option<&str>) -> Result<CleanReply> {
@@ -739,9 +967,9 @@ fn reply<T: Serialize>(result: Result<T>) -> Result<String, String> {
 #[tool_router]
 impl BuilditMcp {
     #[tool(
-        description = "Build a Dockerfile from a workspace subdirectory on a remote builder; pushes \
-        nothing. Returns build_id, exit and the log's last lines. The builder stays up \
-        for `run` and `logs` until `clean`."
+        description = "Start building a Dockerfile (params: context, dockerfile, target, build_args, \
+        timeout_s); pushes nothing. Returns build_id with status running at once. Poll `status` \
+        until succeeded or failed, then `run`/`logs` as needed, and always `clean` the build_id."
     )]
     async fn build(
         &self,
@@ -752,7 +980,20 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Run a command in a fresh container of a successful build. Returns exit, the \
+        description = "Report a build's status (params: build_id): running, succeeded or failed, \
+        with exit, timed_out and the build log's last lines. Poll it after `build`; `clean` when done."
+    )]
+    async fn status(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(p): Parameters<StatusParams>,
+    ) -> Result<String, String> {
+        reply(async { self.broker.status(&caller(&parts)?.sandbox, p).await }.await)
+    }
+
+    #[tool(
+        description = "Run a command (params: build_id, cmd, timeout_s, fetch_paths) in a fresh \
+        container of a build whose status is succeeded. Returns exit, the \
         log name (run:<n>) and its last lines; fetch_paths are copied out of the container into \
         .buildit/<build_id>/<path>."
     )]
@@ -765,8 +1006,8 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Read part of a build or run log, as numbered lines: grep with optional \
-        context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
+        description = "Read part of a build or run log (params: build_id, which, grep, context, \
+        from_line, to_line, tail_lines, max_bytes), as numbered lines: grep with optional context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
         total_lines and matched; output is capped at max_bytes and long lines are clipped. \
         When output overflows max_bytes, tail and grep keep the newest lines (the end of the \
         log) and range keeps the first; truncated is set. \
@@ -781,7 +1022,10 @@ impl BuilditMcp {
         reply(async { self.broker.logs(&caller(&parts)?.sandbox, p).await }.await)
     }
 
-    #[tool(description = "Delete a build's builder pod, or all of this sandbox's builds.")]
+    #[tool(
+        description = "Delete a build's builder pod (params: build_id), or all of this sandbox's \
+        builds when build_id is omitted. Call it once done with a build, succeeded or not."
+    )]
     async fn clean(
         &self,
         Extension(parts): Extension<Parts>,
@@ -810,13 +1054,26 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::backend::Resources;
+    use std::time::Duration;
+
+    use k8s_openapi::api::core::v1::Pod;
+
     use crate::mcp::{
-        Broker, BuildId, Caller, LogsParams, MCP_PATH, TokenLine, bud_argv, parse_tokens, router,
-        unpack,
+        Broker, BuildId, BuildParams, BuildState, BuildStatus, Caller, LogsParams, MCP_PATH,
+        PodView, TokenLine, bud_argv, build_limit, parse_tokens, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
 
     fn broker(client: kube::Client, tokens: &Path, local: Option<&Path>) -> Arc<Broker> {
+        broker_with_deadline(client, tokens, local, 900)
+    }
+
+    fn broker_with_deadline(
+        client: kube::Client,
+        tokens: &Path,
+        local: Option<&Path>,
+        deadline_secs: i64,
+    ) -> Arc<Broker> {
         Arc::new(Broker {
             namespace: client.default_namespace().to_string(),
             client,
@@ -824,7 +1081,7 @@ mod tests {
             default_workdir: Some(SandboxDir::parse("/sandbox/default").unwrap()),
             local_workdir: local.map(Path::to_path_buf),
             resources: Resources::default(),
-            deadline_secs: 900,
+            deadline_secs,
             max_builds: 4,
         })
     }
@@ -955,7 +1212,13 @@ mod tests {
         assert_eq!(status, 200, "{reply}");
         assert!(reply.contains("content-type: application/json"), "{reply}");
         assert!(!reply.contains("mcp-session-id"), "{reply}");
-        for tool in ["\"build\"", "\"run\"", "\"logs\"", "\"clean\""] {
+        for tool in [
+            "\"build\"",
+            "\"status\"",
+            "\"run\"",
+            "\"logs\"",
+            "\"clean\"",
+        ] {
             assert!(reply.contains(tool), "{tool}: {reply}");
         }
         for host in ["host.openshell.internal:8849", "builds.svc"] {
@@ -992,6 +1255,347 @@ mod tests {
         for v in bad {
             assert!(params(v.clone()).query().is_err(), "{v}");
         }
+    }
+
+    #[test]
+    fn build_target_is_an_alias_of_target() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<BuildParams>(v);
+        for key in ["target", "build_target"] {
+            let p = parse(serde_json::json!({ "context": "svc", key: "base" })).unwrap();
+            assert_eq!(p.target.as_deref(), Some("base"), "{key}");
+        }
+        let p = parse(serde_json::json!({ "context": "svc" })).unwrap();
+        assert_eq!(p.target, None);
+        let both = serde_json::json!({ "context": "svc", "target": "a", "build_target": "b" });
+        assert!(parse(both).is_err());
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(BuildParams)).unwrap();
+        assert!(schema["properties"]["target"].is_object(), "{schema}");
+        assert_ne!(schema["additionalProperties"], false, "{schema}");
+    }
+
+    #[test]
+    fn build_states_parse_from_the_state_script() {
+        let exited = |code, timed_out| BuildState::Exited { code, timed_out };
+        let cases = [
+            (
+                "running\n",
+                BuildState::Running,
+                BuildStatus::Running,
+                None,
+                false,
+            ),
+            (
+                "exit 0\n",
+                exited(0, false),
+                BuildStatus::Succeeded,
+                Some(0),
+                false,
+            ),
+            (
+                "exit 1",
+                exited(1, false),
+                BuildStatus::Failed,
+                Some(1),
+                false,
+            ),
+            (
+                "exit 124\n",
+                exited(124, false),
+                BuildStatus::Failed,
+                Some(124),
+                false,
+            ),
+            (
+                "exit 124 timeout\n",
+                exited(124, true),
+                BuildStatus::Failed,
+                Some(124),
+                true,
+            ),
+            (
+                "exit 137 timeout",
+                exited(137, true),
+                BuildStatus::Failed,
+                Some(137),
+                true,
+            ),
+            ("lost\n", BuildState::Lost, BuildStatus::Failed, None, false),
+        ];
+        for (raw, state, status, exit, timed_out) in cases {
+            let parsed = BuildState::parse(raw).unwrap();
+            assert_eq!(parsed, state, "{raw:?}");
+            assert_eq!(parsed.status(), status, "{raw:?}");
+            assert_eq!(parsed.exit(), exit, "{raw:?}");
+            assert_eq!(parsed.timed_out(), timed_out, "{raw:?}");
+        }
+        for bad in [
+            "",
+            "exit ",
+            "exit x",
+            "exit 1 2",
+            "exit 1 timeout x",
+            "exit timeout",
+            "Running",
+            "done",
+        ] {
+            assert!(BuildState::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(BuildState::Expired.status(), BuildStatus::Failed);
+        assert_eq!(BuildState::Expired.exit(), None);
+        assert!(BuildState::Expired.timed_out());
+        assert_eq!(
+            serde_json::to_value([
+                BuildStatus::Running,
+                BuildStatus::Succeeded,
+                BuildStatus::Failed
+            ])
+            .unwrap(),
+            serde_json::json!(["running", "succeeded", "failed"])
+        );
+    }
+
+    fn pod(status: serde_json::Value, deleting: bool) -> Pod {
+        let mut meta = serde_json::json!({ "name": "buildit-1" });
+        if deleting {
+            meta["deletionTimestamp"] = "2026-10-02T00:00:00Z".into();
+        }
+        serde_json::from_value(serde_json::json!({ "metadata": meta, "status": status })).unwrap()
+    }
+
+    fn terminated(message: Option<&str>) -> serde_json::Value {
+        let mut state = serde_json::json!({ "exitCode": 137 });
+        if let Some(m) = message {
+            state["message"] = m.into();
+        }
+        serde_json::json!([{
+            "name": "builder", "image": "buildah", "imageID": "", "ready": false,
+            "restartCount": 0, "state": { "terminated": state }
+        }])
+    }
+
+    #[test]
+    fn ended_pods_still_report_their_build() {
+        let view = |status: serde_json::Value| PodView::of(&[pod(status, false)]);
+        let expired = serde_json::json!({ "phase": "Failed", "reason": "DeadlineExceeded" });
+        assert_eq!(PodView::of(&[]), None);
+        assert_eq!(PodView::of(&[pod(expired.clone(), true)]), None);
+        assert_eq!(
+            view(serde_json::json!({ "phase": "Running" })),
+            Some(PodView::Live)
+        );
+        assert_eq!(
+            view(serde_json::json!({ "phase": "Pending" })),
+            Some(PodView::Live)
+        );
+        assert_eq!(view(serde_json::json!({})), Some(PodView::Live));
+
+        let cases = [
+            (expired.clone(), BuildState::Expired),
+            (
+                serde_json::json!({
+                    "phase": "Failed", "reason": "DeadlineExceeded",
+                    "containerStatuses": terminated(None),
+                }),
+                BuildState::Expired,
+            ),
+            (
+                serde_json::json!({
+                    "phase": "Failed", "reason": "DeadlineExceeded",
+                    "containerStatuses": terminated(Some("garbage")),
+                }),
+                BuildState::Expired,
+            ),
+            (
+                serde_json::json!({
+                    "phase": "Failed", "reason": "DeadlineExceeded",
+                    "containerStatuses": terminated(Some("124 timeout\n")),
+                }),
+                BuildState::Exited {
+                    code: 124,
+                    timed_out: true,
+                },
+            ),
+            (
+                serde_json::json!({
+                    "phase": "Failed", "reason": "DeadlineExceeded",
+                    "containerStatuses": terminated(Some("0\n")),
+                }),
+                BuildState::Exited {
+                    code: 0,
+                    timed_out: false,
+                },
+            ),
+            (
+                serde_json::json!({ "phase": "Succeeded" }),
+                BuildState::Lost,
+            ),
+            (
+                serde_json::json!({ "phase": "Failed", "reason": "Evicted" }),
+                BuildState::Lost,
+            ),
+            (
+                serde_json::json!({
+                    "phase": "Succeeded", "containerStatuses": terminated(Some("2")),
+                }),
+                BuildState::Exited {
+                    code: 2,
+                    timed_out: false,
+                },
+            ),
+        ];
+        for (status, want) in cases {
+            assert_eq!(view(status.clone()), Some(PodView::Ended(want)), "{status}");
+        }
+
+        let Some(PodView::Ended(state)) = view(expired) else {
+            panic!("expired pod is not ended");
+        };
+        assert_eq!(
+            (state.status(), state.exit(), state.timed_out()),
+            (BuildStatus::Failed, None, true)
+        );
+        let Some(PodView::Ended(state)) = view(serde_json::json!({ "phase": "Succeeded" })) else {
+            panic!("finished pod is not ended");
+        };
+        assert_eq!(
+            (state.status(), state.exit(), state.timed_out()),
+            (BuildStatus::Failed, None, false)
+        );
+    }
+
+    #[test]
+    fn build_timeouts_fire_before_the_pod_deadline() {
+        let s = Duration::from_secs;
+        assert_eq!(build_limit(s(1800), 7200, s(0)).unwrap(), s(1800));
+        assert_eq!(build_limit(s(1800), 900, s(0)).unwrap(), s(890));
+        assert_eq!(build_limit(s(1800), 900, s(100)).unwrap(), s(790));
+        assert_eq!(build_limit(s(60), 900, s(100)).unwrap(), s(60));
+        assert_eq!(build_limit(s(1800), 900, s(889)).unwrap(), s(1));
+        let left = build_limit(s(1800), 900, Duration::from_millis(100_500)).unwrap();
+        assert_eq!(left.as_secs(), 789);
+        for (deadline, used) in [(900, 890), (900, 2000), (10, 0), (0, 0), (-5, 0)] {
+            assert!(
+                build_limit(s(1800), deadline, s(used)).is_err(),
+                "{deadline} {used}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_records_exits_timeouts_and_mirrors_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = |name: &str, mirror: Option<&Path>, secs: &str, cmd: &[&str]| {
+            let d = dir.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let (log, exit, term) = (d.join("logs/build.log"), d.join("exit"), d.join("term"));
+            let mirror = mirror.map_or(d.join("mirror"), Path::to_path_buf);
+            let status = std::process::Command::new("sh")
+                .args(["-c", crate::mcp::LAUNCH_SCRIPT, "sh"])
+                .args([&log, &exit, &d.join("pid"), Path::new(secs), &mirror, &term])
+                .args(cmd)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{name}");
+            wait_for(name, || exit.exists());
+            let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+            let log_text = read(&log);
+            wait_for(name, || read(&mirror) == log_text);
+            assert_eq!(read(&term), read(&exit), "{name}");
+            (read(&exit), log_text)
+        };
+
+        let (exit, log) = launch("ok", None, "30", &["sh", "-c", "echo hi; exit 3"]);
+        assert_eq!(exit, "3\n");
+        assert_eq!(log, "$ sh -c echo hi; exit 3\nhi\n");
+        let (exit, _) = launch("own-124", None, "30", &["sh", "-c", "exit 124"]);
+        assert_eq!(exit, "124\n");
+        let (exit, _) = launch("slow", None, "1", &["sleep", "30"]);
+        assert_eq!(exit, "124 timeout\n");
+        assert_eq!(
+            BuildState::parse(&format!("exit {exit}")).unwrap(),
+            BuildState::Exited {
+                code: 124,
+                timed_out: true
+            }
+        );
+
+        let nowhere = dir.path().join("missing/mirror");
+        let d = dir.path().join("no-mirror");
+        std::fs::create_dir_all(&d).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", crate::mcp::LAUNCH_SCRIPT, "sh"])
+            .args([&d.join("build.log"), &d.join("exit"), &d.join("pid")])
+            .args([
+                Path::new("30"),
+                &nowhere,
+                &dir.path().join("missing/term"),
+                Path::new("true"),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        wait_for("no-mirror", || d.join("exit").exists());
+        assert_eq!(std::fs::read_to_string(d.join("exit")).unwrap(), "0\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_script_reports_zombies_as_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let (exit, pid) = (dir.path().join("exit"), dir.path().join("pid"));
+        let state = || {
+            let out = std::process::Command::new("sh")
+                .args(["-c", crate::mcp::STATE_SCRIPT, "sh"])
+                .args([&exit, &pid])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            BuildState::parse(&String::from_utf8(out.stdout).unwrap()).unwrap()
+        };
+
+        assert_eq!(state(), BuildState::Lost);
+        std::fs::write(&pid, "not-a-pid\n").unwrap();
+        assert_eq!(state(), BuildState::Lost);
+
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        std::fs::write(&pid, format!("{}\n", sleeper.id())).unwrap();
+        assert_eq!(state(), BuildState::Running);
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+
+        let mut zombie = std::process::Command::new("true").spawn().unwrap();
+        let stat = format!("/proc/{}/stat", zombie.id());
+        wait_for("a zombie", || {
+            std::fs::read_to_string(&stat)
+                .is_ok_and(|s| s.rsplit_once(") ").is_some_and(|(_, r)| r.starts_with('Z')))
+        });
+        std::fs::write(&pid, format!("{}\n", zombie.id())).unwrap();
+        assert_eq!(state(), BuildState::Lost);
+
+        std::fs::write(&exit, "124 timeout\n").unwrap();
+        assert_eq!(
+            state(),
+            BuildState::Exited {
+                code: 124,
+                timed_out: true
+            }
+        );
+        zombie.wait().unwrap();
     }
 
     #[test]
@@ -1106,7 +1710,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
-    async fn e2e_build_restart_run_fetch_logs_and_clean() {
+    async fn e2e_build_poll_restart_run_fetch_logs_and_clean() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -1115,7 +1719,7 @@ mod tests {
         std::fs::write(
             work.join("svc/Dockerfile"),
             "FROM docker.io/library/busybox:latest AS base\n\
-             RUN echo hello-from-build && mkdir -p /out && echo artifact > /out/a.txt\n\
+             RUN echo hello-from-build && sleep 20 && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS broken\n\
              RUN exit 1\n",
         )
@@ -1127,18 +1731,57 @@ mod tests {
         };
 
         let (addr, first) = serve(cluster().await).await;
-        let args = serde_json::json!({ "context": "svc", "target": "base" });
+        let args = serde_json::json!({ "context": "svc", "build_target": "base" });
         let built = call(&addr, "tok-a", "build", args).await.unwrap();
-        assert_eq!(built["exit"], 0, "{built}");
-        let tail = built["log_tail"].as_str().unwrap();
-        assert!(tail.contains("hello-from-build"), "{built}");
+        assert_eq!(built["status"], "running", "{built}");
         let id = built["build_id"].as_str().unwrap().to_string();
+        let args = serde_json::json!({ "context": "svc", "target": "broken" });
+        let broken = call(&addr, "tok-a", "build", args).await.unwrap();
+        assert_eq!(broken["status"], "running", "{broken}");
+        let broken = broken["build_id"].as_str().unwrap().to_string();
+
+        let only_id = serde_json::json!({ "build_id": id });
+        let status = call(&addr, "tok-a", "status", only_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(status["status"], "running", "{status}");
+        assert_eq!(status["exit"], serde_json::Value::Null, "{status}");
+        let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
+        let e = call(&addr, "tok-a", "run", run).await.unwrap_err();
+        assert!(e.contains("still building"), "{e}");
         first.abort();
 
-        // a new server process with no memory of the build
+        // a new server process with no memory of the builds
         let (addr, _second) = serve(cluster().await).await;
         let a = |tool, args| call(&addr, "tok-a", tool, args);
         let b = |tool, args| call(&addr, "tok-b", tool, args);
+        let finished = |build_id: String| {
+            let addr = addr.clone();
+            async move {
+                let args = serde_json::json!({ "build_id": build_id });
+                for _ in 0..150 {
+                    let status = call(&addr, "tok-a", "status", args.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        return status;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {build_id} still running after 300s");
+            }
+        };
+        let done = finished(id.clone()).await;
+        assert_eq!(done["status"], "succeeded", "{done}");
+        assert_eq!(done["exit"], 0, "{done}");
+        assert_eq!(done["timed_out"], false, "{done}");
+        let tail = done["log_tail"].as_str().unwrap();
+        assert!(tail.contains("hello-from-build"), "{done}");
+        let failed = finished(broken.clone()).await;
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_ne!(failed["exit"], 0, "{failed}");
+        assert!(failed["exit"].is_i64(), "{failed}");
+        let run = serde_json::json!({ "build_id": broken, "cmd": ["true"] });
+        let e = a("run", run).await.unwrap_err();
+        assert!(e.contains("failed (exit"), "{e}");
         let args = serde_json::json!({
             "build_id": id,
             "cmd": ["sh", "-c", "echo out-1; exit 5"],
@@ -1184,17 +1827,106 @@ mod tests {
         let args = serde_json::json!({ "build_id": id, "which": "run:2" });
         assert!(a("logs", args).await.is_err());
 
-        let only_id = serde_json::json!({ "build_id": id });
         let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
-        for (tool, args) in [("run", run), ("logs", only_id.clone())] {
+        for (tool, args) in [
+            ("run", run),
+            ("logs", only_id.clone()),
+            ("status", only_id.clone()),
+        ] {
             let e = b(tool, args).await.unwrap_err();
             assert!(e.contains("no live build"), "{tool}: {e}");
         }
         let cleaned = b("clean", only_id.clone()).await.unwrap();
         assert_eq!(cleaned["deleted"], serde_json::json!([]));
+        let cleaned = a("clean", serde_json::json!({ "build_id": broken }))
+            .await
+            .unwrap();
+        assert_eq!(cleaned["deleted"], serde_json::json!([broken]));
         let cleaned = a("clean", serde_json::json!({})).await.unwrap();
         assert_eq!(cleaned["deleted"], serde_json::json!([id]));
-        let e = a("logs", only_id).await.unwrap_err();
+        for tool in ["logs", "status"] {
+            let e = a(tool, only_id.clone()).await.unwrap_err();
+            assert!(e.contains("no live build"), "{tool}: {e}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_pod_deadline_reports_failed_timed_out() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(work.join("svc")).unwrap();
+        std::fs::write(
+            work.join("svc/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nRUN echo deadline-build && sleep 600\n",
+        )
+        .unwrap();
+        let file = tokens(&work, "tok-a sb-a\n");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let deadline = 120;
+        let broker = broker_with_deadline(client.clone(), &file, Some(&work), deadline);
+        let pods: kube::Api<Pod> = kube::Api::namespaced(client, &broker.namespace);
+        let (addr, _task) = serve(broker).await;
+        let a = |tool, args| call(&addr, "tok-a", tool, args);
+
+        let built = a("build", serde_json::json!({ "context": "svc" }))
+            .await
+            .unwrap();
+        let id = built["build_id"].as_str().unwrap().to_string();
+        let only_id = serde_json::json!({ "build_id": id });
+
+        let mut status = serde_json::Value::Null;
+        for _ in 0..deadline {
+            status = a("status", only_id.clone()).await.unwrap();
+            if status["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(status["status"], "failed", "{status}");
+        assert_eq!(status["timed_out"], true, "{status}");
+        assert_eq!(status["exit"], 124, "{status}");
+        let phase = pods.get(&id).await.unwrap().status.unwrap().phase;
+        assert_eq!(
+            phase.as_deref(),
+            Some("Running"),
+            "the build timeout fired first"
+        );
+
+        let mut expired = false;
+        for _ in 0..120 {
+            let pod = pods.get(&id).await.unwrap();
+            if pod.status.and_then(|s| s.reason).as_deref() == Some("DeadlineExceeded") {
+                expired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert!(expired, "pod {id} never hit its deadline");
+
+        let ended = a("status", only_id.clone()).await.unwrap();
+        assert_eq!(ended["status"], "failed", "{ended}");
+        assert_eq!(ended["timed_out"], true, "{ended}");
+        assert_eq!(ended["exit"], 124, "{ended}");
+        let tail = ended["log_tail"].as_str().unwrap();
+        assert!(tail.contains(":$ buildah bud"), "{ended}");
+        assert!(tail.contains("deadline-build"), "{ended}");
+
+        let grep = serde_json::json!({ "build_id": id, "grep": "^deadline-build$" });
+        let grep = a("logs", grep).await.unwrap();
+        assert_eq!(grep["matched"], 1, "{grep}");
+        let run = serde_json::json!({ "build_id": id, "which": "run:1" });
+        let e = a("logs", run).await.unwrap_err();
+        assert!(e.contains("only its build log"), "{e}");
+        let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
+        let e = a("run", run).await.unwrap_err();
+        assert!(e.contains("has ended"), "{e}");
+
+        let cleaned = a("clean", only_id.clone()).await.unwrap();
+        assert_eq!(cleaned["deleted"], serde_json::json!([id]));
+        let e = a("status", only_id).await.unwrap_err();
         assert!(e.contains("no live build"), "{e}");
     }
 }

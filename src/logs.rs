@@ -94,6 +94,16 @@ impl Log {
         Ok(Self::from_bytes(out.stdout, window))
     }
 
+    pub async fn from_container(pod: &BuilderPod, window: u64) -> Result<Self> {
+        Ok(Self::last(pod.container_log().await?.into_bytes(), window))
+    }
+
+    fn last(mut bytes: Vec<u8>, window: u64) -> Self {
+        let keep = usize::try_from(window.saturating_add(1)).unwrap_or(usize::MAX);
+        bytes.drain(..bytes.len().saturating_sub(keep));
+        Self::from_bytes(bytes, window)
+    }
+
     fn from_bytes(mut bytes: Vec<u8>, window: u64) -> Self {
         let truncated_head = bytes.len() as u64 > window;
         if truncated_head {
@@ -407,5 +417,20 @@ mod tests {
             Log::from_bytes(b"ok \xff\n".to_vec(), MAX_READ).query(&Query::Tail { lines: 1 }, 1024);
         assert!(!page.truncated_head);
         assert_eq!(page.lines, "1:ok \u{fffd}\n");
+    }
+
+    #[test]
+    fn container_logs_keep_the_newest_window() {
+        let page = |log: Log| log.query(&Query::Range { from: 1, to: None }, 1024);
+        let short = page(Log::last(b"a\nb\n".to_vec(), 16));
+        assert!(!short.truncated_head);
+        assert_eq!(short.lines, "1:a\n2:b\n");
+        let long = page(Log::last(b"first\nsecond\nthird\n".to_vec(), 9));
+        assert!(long.truncated_head);
+        assert_eq!(long.lines, "1:third\n");
+        let exact = page(Log::last(b"0123456789".to_vec(), 9));
+        assert!(exact.truncated_head);
+        assert_eq!(exact.lines, "");
+        assert_eq!(page(Log::last(Vec::new(), 9)).total_lines, 0);
     }
 }

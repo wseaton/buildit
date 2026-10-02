@@ -42,7 +42,7 @@ enum Cmd {
         #[arg(long)]
         kubecontext: Option<String>,
     },
-    /// Serve build/run/logs/clean as stateless MCP tools over streamable http
+    /// Serve build/status/run/logs/clean as stateless MCP tools over streamable http
     Mcp(Box<mcp::McpArgs>),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit)
     Clean {
@@ -114,6 +114,13 @@ pub struct BuildArgs {
     /// self-prune; pass any --context-label to override the default.
     #[arg(long = "context-label", value_name = "KEY=VALUE", value_parser = parse_kv)]
     pub context_labels: Vec<(String, String)>,
+    /// Multi-stage build target to stop at
+    #[arg(long, value_name = "STAGE")]
+    pub target: Option<String>,
+    /// Build without pushing (pod mode only). Nothing is printed to stdout,
+    /// and registry credentials are shipped only if ~/.docker/config.json has them.
+    #[arg(long)]
+    pub no_push: bool,
     /// Build args, repeatable: --build-arg KEY=VALUE
     #[arg(long = "build-arg", value_name = "KEY=VALUE")]
     pub build_args: Vec<String>,
