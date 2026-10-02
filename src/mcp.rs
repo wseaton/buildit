@@ -77,7 +77,7 @@ case "${stat%% *}" in
   ""|Z|X) if [ -f "$1" ]; then echo "exit $(cat "$1")"; else echo lost; fi ;;
   *) echo running ;;
 esac"#;
-const ALLOC_SCRIPT: &str = r#"set -C; n=1; until : > "$1/run-$n.log"; do n=$((n + 1)); [ "$n" -le 9999 ] || exit 1; done 2>/dev/null; echo "$n""#;
+const ALLOC_SCRIPT: &str = r#"set -C; n=1; until true > "$1/run-$n.log"; do n=$((n + 1)); [ "$n" -le 9999 ] || exit 1; done 2>/dev/null; echo "$n""#;
 const FETCH_SCRIPT: &str = r#"ctr="$1"; shift; mnt=$(buildah mount "$ctr") || exit 1; cd "$mnt" || exit 1; exec tar -cf - --ignore-failed-read -- "$@""#;
 
 #[derive(Args)]
@@ -1548,6 +1548,26 @@ mod tests {
         assert!(status.success());
         wait_for("no-mirror", || d.join("exit").exists());
         assert_eq!(std::fs::read_to_string(d.join("exit")).unwrap(), "0\n");
+    }
+
+    #[test]
+    fn run_logs_allocate_in_sequence_under_a_posix_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let alloc = || {
+            let out = std::process::Command::new("bash")
+                .args(["--posix", "-c", crate::mcp::ALLOC_SCRIPT, "sh"])
+                .arg(dir.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        assert_eq!(alloc(), "1\n");
+        assert_eq!(alloc(), "2\n");
+        std::fs::remove_file(dir.path().join("run-1.log")).unwrap();
+        assert_eq!(alloc(), "1\n");
+        assert_eq!(alloc(), "3\n");
     }
 
     #[cfg(target_os = "linux")]
