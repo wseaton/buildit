@@ -110,6 +110,9 @@ pub struct McpArgs {
     /// Live builder pods per sandbox; `build` is refused past this
     #[arg(long, default_value_t = 4)]
     pub max_builds: usize,
+    /// Schedule builder pods only on nodes of this architecture (kubernetes.io/arch)
+    #[arg(long)]
+    pub node_arch: Option<String>,
     /// Resource requests for builder pods, repeatable: --request cpu=2
     #[arg(long = "request", value_name = "KEY=QTY", value_parser = crate::parse_kv)]
     pub requests: Vec<(String, String)>,
@@ -138,6 +141,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         },
         deadline_secs: args.pod_deadline,
         max_builds: args.max_builds,
+        node_arch: args.node_arch,
     });
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
@@ -271,6 +275,7 @@ pub struct Broker {
     resources: Resources,
     deadline_secs: i64,
     max_builds: usize,
+    node_arch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -727,6 +732,11 @@ impl Broker {
         spec.active_deadline_seconds = Some(self.deadline_secs);
         spec.automount_service_account_token = Some(false);
         spec.enable_service_links = Some(false);
+        if let Some(arch) = &self.node_arch {
+            spec.node_selector
+                .get_or_insert_default()
+                .insert("kubernetes.io/arch".to_string(), arch.clone());
+        }
         for c in &mut spec.containers {
             c.command = Some(argv(["sleep", &self.deadline_secs.to_string()]));
         }
@@ -1083,6 +1093,7 @@ mod tests {
             resources: Resources::default(),
             deadline_secs,
             max_builds: 4,
+            node_arch: None,
         })
     }
 
@@ -1667,6 +1678,32 @@ mod tests {
         assert!(bud_argv(&id, &df, None, &bad).is_err());
     }
 
+    #[tokio::test]
+    async fn builder_pods_pin_the_node_arch_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = SandboxName::parse("sb-a").unwrap();
+        let id = BuildId::parse("buildit-1").unwrap();
+        let unpinned = broker(offline_client(), &tokens(dir.path(), ""), None)
+            .builder_pod(&sandbox, &id)
+            .unwrap();
+        let arch = |pod: Pod| {
+            pod.spec
+                .unwrap()
+                .node_selector
+                .and_then(|s| s.get("kubernetes.io/arch").cloned())
+        };
+        assert_eq!(arch(unpinned), None);
+
+        let pinned = Broker {
+            node_arch: Some("amd64".to_string()),
+            ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
+        };
+        assert_eq!(
+            arch(pinned.builder_pod(&sandbox, &id).unwrap()).as_deref(),
+            Some("amd64")
+        );
+    }
+
     #[test]
     fn unpack_keeps_files_and_dirs_inside_dest_only() {
         let mut b = tar::Builder::new(Vec::new());
@@ -1845,7 +1882,16 @@ mod tests {
             "{ctx}"
         );
         let args = serde_json::json!({ "build_id": id, "which": "run:2" });
-        assert!(a("logs", args).await.is_err());
+        assert!(a("logs", args.clone()).await.is_err());
+        let again = serde_json::json!({ "build_id": id, "cmd": ["sh", "-c", "echo out-2"] });
+        let ran = a("run", again).await.unwrap();
+        assert_eq!(ran["exit"], 0, "{ran}");
+        assert_eq!(ran["log"], "run:2");
+        let second = a("logs", args).await.unwrap();
+        assert!(
+            second["lines"].as_str().unwrap().contains(":out-2\n"),
+            "{second}"
+        );
 
         let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });
         for (tool, args) in [
