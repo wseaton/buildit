@@ -21,6 +21,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, PodOpts, Resources};
+use crate::logs::{LOG_DIR, Log, LogName, Page, Query};
 use crate::pod::BuilderPod;
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace};
 
@@ -33,18 +34,16 @@ const MANAGED_BY: &str = "mcp";
 const LABEL_SANDBOX: &str = "buildit.dev/sandbox";
 const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
 
-const LOG_DIR: &str = "/tmp/buildit-logs";
 const POD_READY: Duration = Duration::from_secs(180);
 const DEFAULT_BUILD_TIMEOUT_S: u64 = 1800;
 const DEFAULT_RUN_TIMEOUT_S: u64 = 600;
 const FROM_TIMEOUT: Duration = Duration::from_secs(300);
 const EXEC_SLACK: Duration = Duration::from_secs(60);
 const FETCH_LIMIT: u64 = 512 * 1024 * 1024;
-const SUMMARY_LINES: u64 = 40;
-const SUMMARY_BYTES: u64 = 8 * 1024;
+const SUMMARY_LINES: usize = 40;
+const SUMMARY_BYTES: usize = 8 * 1024;
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
-const TAIL_READ: u64 = 1024 * 1024;
 
 // appends `$ argv`, then the command's stdout and stderr, to the log
 const STEP_SCRIPT: &str = r#"log="$1"; secs="$2"; shift 2; mkdir -p "${log%/*}"; printf '$ %s\n' "$*" >> "$log"; exec timeout "$secs" "$@" >> "$log" 2>&1"#;
@@ -278,8 +277,10 @@ pub struct LogsParams {
     pub build_id: String,
     /// "build" (default) or "run:<n>"
     pub which: Option<String>,
-    /// Extended regex; returns matching lines as `N:text`
+    /// Regex (Rust syntax); returns matches as `N:text`, context as `N-text`, gaps as `--`
     pub grep: Option<String>,
+    /// Lines of context around each grep match (max 20)
+    pub context: Option<u64>,
     /// First line to return (1-based)
     pub from_line: Option<u64>,
     /// Last line to return
@@ -311,12 +312,6 @@ pub struct RunReply {
     pub timed_out: bool,
     pub log_tail: String,
     pub fetched: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LogsReply {
-    pub lines: String,
-    pub truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -372,9 +367,9 @@ fn bud_argv(
     Ok(out)
 }
 
-async fn step(pod: &BuilderPod, log: &str, limit: Duration, cmd: &[String]) -> Result<Outcome> {
+async fn step(pod: &BuilderPod, log: LogName, limit: Duration, cmd: &[String]) -> Result<Outcome> {
     let mut sh = argv(["sh", "-c", STEP_SCRIPT, "sh"]);
-    sh.extend([format!("{LOG_DIR}/{log}"), limit.as_secs().to_string()]);
+    sh.extend([log.path(), limit.as_secs().to_string()]);
     sh.extend_from_slice(cmd);
     let started = Instant::now();
     let Ok(out) = tokio::time::timeout(limit + EXEC_SLACK, pod.exec_output(&sh, 4096)).await else {
@@ -392,52 +387,35 @@ async fn step(pod: &BuilderPod, log: &str, limit: Duration, cmd: &[String]) -> R
     })
 }
 
-// keep_end keeps the last max bytes, cut at a line start
-async fn read_capped(
-    pod: &BuilderPod,
-    cmd: &[String],
-    max: u64,
-    keep_end: bool,
-) -> Result<LogsReply> {
-    let out = pod
-        .exec_output(cmd, if keep_end { TAIL_READ } else { max })
-        .await?;
-    if let Some(code) = out.code
-        && !(code == 0 || (code == 1 && out.stderr.is_empty()))
-    {
-        bail!(
-            "{}: {}",
-            cmd.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let mut bytes = out.stdout;
-    let mut truncated = out.code.is_none();
-    let max = usize::try_from(max).unwrap_or(usize::MAX);
-    if keep_end && bytes.len() > max {
-        let cut = bytes.len() - max;
-        let start = bytes[cut..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(cut, |i| cut + i + 1);
-        bytes.drain(..start);
-        truncated = true;
-    }
-    Ok(LogsReply {
-        lines: String::from_utf8_lossy(&bytes).into_owned(),
-        truncated,
-    })
+async fn log_tail(pod: &BuilderPod, log: LogName) -> Result<String> {
+    let tail = Query::Tail {
+        lines: SUMMARY_LINES,
+    };
+    Ok(Log::fetch(pod, log)
+        .await?
+        .query(&tail, SUMMARY_BYTES)
+        .lines)
 }
 
-async fn log_tail(pod: &BuilderPod, log: &str) -> Result<String> {
-    let cmd = argv([
-        "tail",
-        "-n",
-        &SUMMARY_LINES.to_string(),
-        "--",
-        &format!("{LOG_DIR}/{log}"),
-    ]);
-    Ok(read_capped(pod, &cmd, SUMMARY_BYTES, true).await?.lines)
+fn usize_of(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+impl LogsParams {
+    fn query(&self) -> Result<Query> {
+        match (&self.grep, self.from_line, self.to_line, self.tail_lines) {
+            (Some(p), None, None, None) => Query::grep(p, usize_of(self.context.unwrap_or(0))),
+            _ if self.context.is_some() => bail!("context needs grep"),
+            (None, None, None, n) => Ok(Query::Tail {
+                lines: usize_of(n.unwrap_or(100)),
+            }),
+            (None, from, to, None) => Ok(Query::Range {
+                from: usize_of(from.unwrap_or(1)),
+                to: to.map(usize_of),
+            }),
+            _ => bail!("grep, from_line/to_line and tail_lines are mutually exclusive"),
+        }
+    }
 }
 
 // regular files and directories only; anything else, or outside dest, is dropped
@@ -613,12 +591,12 @@ impl Broker {
             pod.exec_with_stdin(&Backend::Buildah.untar_command(), &tarball)
                 .await?;
             let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
-            let outcome = step(&pod, "build.log", limit, &bud).await?;
+            let outcome = step(&pod, LogName::Build, limit, &bud).await?;
             Ok(BuildReply {
                 build_id: id.0.clone(),
                 exit: outcome.exit,
                 timed_out: outcome.timed_out,
-                log_tail: log_tail(&pod, "build.log").await?,
+                log_tail: log_tail(&pod, LogName::Build).await?,
             })
         }
         .await;
@@ -648,16 +626,16 @@ impl Broker {
             .trim()
             .parse()
             .with_context(|| format!("bad run number {alloc:?}"))?;
-        let log = format!("run-{n}.log");
+        let log = LogName::Run(n);
         let ctr = format!("{}-run{n}", id.0);
         let from = argv(["buildah", "from", "--pull-never", "--name", &ctr, &id.tag()]);
-        let mut outcome = step(&pod, &log, FROM_TIMEOUT, &from).await?;
+        let mut outcome = step(&pod, log, FROM_TIMEOUT, &from).await?;
         let mut fetched = Ok(Vec::new());
         if outcome.exit == Some(0) {
             let mut cmd = argv(["buildah", "run", &ctr, "--"]);
             cmd.extend(p.cmd);
             let limit = timeout(p.timeout_s, DEFAULT_RUN_TIMEOUT_S);
-            outcome = step(&pod, &log, limit, &cmd).await?;
+            outcome = step(&pod, log, limit, &cmd).await?;
             if !paths.is_empty() {
                 fetched = self.fetch(caller, &pod, &ctr, &id, &paths).await;
             }
@@ -667,10 +645,10 @@ impl Broker {
         }
         let fetched = fetched?;
         Ok(RunReply {
-            log: format!("run:{n}"),
+            log: log.to_string(),
             exit: outcome.exit,
             timed_out: outcome.timed_out,
-            log_tail: log_tail(&pod, &log).await?,
+            log_tail: log_tail(&pod, log).await?,
             fetched: fetched
                 .iter()
                 .map(|f| format!("{RESULTS_DIR}/{}/{f}", id.0))
@@ -705,36 +683,16 @@ impl Broker {
         Ok(fetched)
     }
 
-    pub async fn logs(&self, sandbox: &SandboxName, p: LogsParams) -> Result<LogsReply> {
+    pub async fn logs(&self, sandbox: &SandboxName, p: LogsParams) -> Result<Page> {
         let id = BuildId::parse(&p.build_id)?;
-        let file = match p.which.as_deref().unwrap_or("build") {
-            "build" => "build.log".to_string(),
-            which => match which
-                .strip_prefix("run:")
-                .and_then(|n| n.parse::<u32>().ok())
-            {
-                Some(n) => format!("run-{n}.log"),
-                None => bail!("which must be build or run:<n>, got {which:?}"),
-            },
-        };
+        let name = LogName::parse(p.which.as_deref().unwrap_or("build"))?;
+        let query = p.query()?;
         let max = p
             .max_bytes
             .unwrap_or(DEFAULT_LOG_BYTES)
             .clamp(1024, MAX_LOG_BYTES);
         let pod = self.find(sandbox, &id).await?;
-        let path = format!("{LOG_DIR}/{file}");
-        if let Some(pattern) = &p.grep {
-            let cmd = argv(["grep", "-n", "-E", "-e", pattern, "--", &path]);
-            return read_capped(&pod, &cmd, max, false).await;
-        }
-        if p.from_line.is_some() || p.to_line.is_some() {
-            let from = p.from_line.unwrap_or(1).max(1);
-            let to = p.to_line.map_or("$".to_string(), |t| t.to_string());
-            let cmd = argv(["sed", "-n", &format!("{from},{to}p"), "--", &path]);
-            return read_capped(&pod, &cmd, max, false).await;
-        }
-        let n = p.tail_lines.unwrap_or(100).to_string();
-        read_capped(&pod, &argv(["tail", "-n", &n, "--", &path]), max, true).await
+        Ok(Log::fetch(&pod, name).await?.query(&query, usize_of(max)))
     }
 
     pub async fn clean(&self, sandbox: &SandboxName, id: Option<&str>) -> Result<CleanReply> {
@@ -804,8 +762,11 @@ impl BuilditMcp {
     }
 
     #[tool(
-        description = "Read part of a build or run log: grep (numbered matches), else a \
-        from_line/to_line range, else the last tail_lines. Output is capped at max_bytes."
+        description = "Read part of a build or run log, as numbered lines: grep with optional \
+        context, a from_line/to_line range, or the last tail_lines (default 100). Reports \
+        total_lines and matched; output is capped at max_bytes and long lines are clipped. \
+        Only the newest 4 MiB is read; when truncated_head is set, line 1 is the first whole \
+        line of that window."
     )]
     async fn logs(
         &self,
@@ -845,7 +806,8 @@ mod tests {
 
     use crate::backend::Resources;
     use crate::mcp::{
-        Broker, BuildId, Caller, MCP_PATH, TokenLine, bud_argv, parse_tokens, router, unpack,
+        Broker, BuildId, Caller, LogsParams, MCP_PATH, TokenLine, bud_argv, parse_tokens, router,
+        unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
 
@@ -998,6 +960,33 @@ mod tests {
         assert_eq!(post(&addr, "127.0.0.1", "", list).await.0, 401);
         let wrong = "Authorization: Bearer nope\r\n";
         assert_eq!(post(&addr, "127.0.0.1", wrong, list).await.0, 401);
+    }
+
+    #[test]
+    fn log_queries_take_one_mode() {
+        let params = |v: serde_json::Value| -> LogsParams {
+            let mut v = v;
+            v["build_id"] = "b".into();
+            serde_json::from_value(v).unwrap()
+        };
+        let ok = [
+            serde_json::json!({}),
+            serde_json::json!({ "tail_lines": 5 }),
+            serde_json::json!({ "from_line": 2 }),
+            serde_json::json!({ "grep": "x", "context": 2 }),
+        ];
+        for v in ok {
+            assert!(params(v.clone()).query().is_ok(), "{v}");
+        }
+        let bad = [
+            serde_json::json!({ "grep": "x", "tail_lines": 5 }),
+            serde_json::json!({ "grep": "x", "to_line": 5 }),
+            serde_json::json!({ "from_line": 1, "tail_lines": 5 }),
+            serde_json::json!({ "context": 1 }),
+        ];
+        for v in bad {
+            assert!(params(v.clone()).query().is_err(), "{v}");
+        }
     }
 
     #[test]
@@ -1168,14 +1157,27 @@ mod tests {
                 .ends_with(":hello-from-build\n")
         );
         assert_eq!(grep["lines"].as_str().unwrap().lines().count(), 1);
+        assert_eq!(grep["matched"], 1, "{grep}");
+        assert_eq!(grep["truncated_head"], false, "{grep}");
         let args = serde_json::json!({ "build_id": id, "which": "run:1", "to_line": 1 });
         let line = a("logs", args).await.unwrap();
         assert!(
             line["lines"]
                 .as_str()
                 .unwrap()
-                .starts_with("$ buildah from")
+                .starts_with("1:$ buildah from"),
+            "{line}"
         );
+        let args = serde_json::json!({ "build_id": id, "which": "run:1", "grep": "^out-1$", "context": 1 });
+        let ctx = a("logs", args).await.unwrap();
+        assert_eq!(ctx["matched"], 1, "{ctx}");
+        let ctx = ctx["lines"].as_str().unwrap();
+        assert!(
+            ctx.contains(":out-1\n") && ctx.contains("-$ buildah run"),
+            "{ctx}"
+        );
+        let args = serde_json::json!({ "build_id": id, "which": "run:2" });
+        assert!(a("logs", args).await.is_err());
 
         let only_id = serde_json::json!({ "build_id": id });
         let run = serde_json::json!({ "build_id": id, "cmd": ["true"] });

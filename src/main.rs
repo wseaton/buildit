@@ -3,6 +3,7 @@ mod backend;
 mod build;
 mod context;
 mod job;
+mod logs;
 mod mcp;
 mod oci;
 mod pod;

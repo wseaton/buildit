@@ -322,6 +322,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "oci-client",
+ "regex",
  "rmcp",
  "rustls",
  "serde",
