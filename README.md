@@ -136,8 +136,8 @@ tools over stateless streamable http, for agents in sandboxes that can't build
 images. `build` downloads a workspace subdirectory from the caller's sandbox,
 starts a buildah build of it in a builder pod, optionally to a `target` stage
 (`build_target` is accepted too), without pushing, and returns its `build_id`
-while the build runs on in the pod. `status` reports `running`, `succeeded` or
-`failed` with the exit code, `timed_out`, and the end of the build log; poll
+while the build runs on in the pod. `status` reports `running`, `succeeded`,
+`failed` or `cancelled` with the exit code, `timed_out`, and the end of the build log; poll
 it, then `run` a succeeded build and `clean` it when done. The build's
 `timeout_s` is capped to end before the pod deadline. A pod that has ended
 still reports its build: the last recorded exit, else `failed` (`timed_out`
@@ -151,6 +151,21 @@ of `grep` (a Rust regex, with up to 20 lines of `context`), a
 numbered lines capped at `max_bytes` (default 16 KiB, max 64 KiB); on
 overflow, grep and tail keep the end of the log and range keeps its start.
 `clean` deletes builder pods.
+
+Build and run steps run detached in the builder pod. A step's exit code,
+cancellation and fetched tarball are kept in files next to its log, so any
+server process can report on it. Clients that declare the
+`io.modelcontextprotocol/tasks` extension (protocol 2026-07-28) get a task
+back from `build` and `run` as soon as the step starts, `build/<build_id>` or
+`run/<build_id>/<n>`, and poll `tasks/get`. A build task completes with the
+`status` reply, a run task with the reply `run` returns; `isError` is set
+unless the step succeeded, and on a failed fetch. `fetch_paths` are copied
+into the sandbox by the first `tasks/get` that sees the run finish.
+`tasks/cancel` kills the step (a cancelled run also removes its container) and
+is a no-op on a finished task. Task state lives in the pod, so it survives
+server restarts; a build task outlives its pod's end like `status` does, a
+run task goes away with the pod. Clients without the extension get `build`'s
+immediate reply and a `run` held open until the run ends.
 
 Callers are identified by the bearer token alone: `MCP_TOKENS_FILE` holds
 `<token> <sandbox> [<workdir>]` lines (a missing workdir falls back to
