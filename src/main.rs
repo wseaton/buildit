@@ -9,6 +9,8 @@ mod oci;
 mod pod;
 mod sandbox;
 mod schedule;
+mod step;
+mod task;
 
 use std::path::PathBuf;
 

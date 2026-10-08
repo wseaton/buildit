@@ -36,6 +36,9 @@ pub struct RelPath(String);
 
 impl RelPath {
     pub fn parse(raw: &str) -> Result<Self> {
+        if raw.chars().any(char::is_control) {
+            bail!("path {raw:?} must not contain control characters");
+        }
         let mut parts = Vec::new();
         for comp in Path::new(raw).components() {
             match comp {
@@ -253,6 +256,8 @@ mod tests {
             "svc/../..",
             ".git",
             "a/.claude/x",
+            "out/a\nb",
+            "out\t",
         ] {
             assert!(RelPath::parse(bad).is_err(), "{bad:?}");
         }
