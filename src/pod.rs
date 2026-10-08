@@ -1,3 +1,4 @@
+use std::hash::{BuildHasher, RandomState};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,10 +28,7 @@ pub(crate) fn unique_name() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!(
-        "buildit-{:08x}",
-        (nanos ^ u128::from(std::process::id())) as u32
-    )
+    format!("buildit-{:016x}", RandomState::new().hash_one(nanos))
 }
 
 impl BuilderPod {
